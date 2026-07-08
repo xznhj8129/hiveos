@@ -1,4 +1,6 @@
 # MPFC
+## Multi-Protocol Flight Computer
+*Monty Python's Flying Clankers*
 
 ## WIP
 This is pre-0.01 initial development and sketching out, a lot will change quickly. A lot of the current architecture, message formats, schema types, networking and else may change dramatically.
