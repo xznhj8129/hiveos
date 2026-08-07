@@ -2,3 +2,4 @@
 * Pi interface module for GPIO, Wi-Fi, BT, etc
 * Expand OCCID adapter coverage where real Programs require additional state or commands
 * Add executable integration coverage for MAVSDK/PX4, ArduPilot, MSP/INAV, CoT, and tracker paths
+* Evaluate a non-blocking/streaming path for high-rate immediate UAV commands such as 20 Hz `SetControlAttitudeCommand`; keep OCCID semantics unchanged
