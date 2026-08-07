@@ -19,15 +19,23 @@ from typing import Any, Dict, List
 
 from lib.common import CONTROL_SHUTDOWN_TOPIC, build_envelope, connect_bus_client, load_config
 from lib.mqtt_bus_client import MqttPublishError
-from protocols.namespace_loader import load_protocol_namespace
+from lib.occid_bus import occid
 
 CONFIG_ENV = "MAIN_CONFIG"
 PLACEHOLDER_RE = re.compile(r"<([A-Za-z0-9_]+)>")
 ENUM_TOKEN_RE = re.compile(r"[^A-Za-z0-9]+")
-UAV = load_protocol_namespace("uav")
+
+# Config spelling compatibility only. These aliases are not semantic protocol
+# aliases and are normalized immediately into OCCID enum member names.
+ENUM_ALIASES = {
+    occid.TelemetryType: {
+        "MAVLINK2": "MAVLINK",
+        "MAVLINK1": "MAVLINK",
+    },
+}
 
 
-def parse_runtime_overrides(argv: list[str]) -> Dict[str, str]:  # Parse `--key=value` CLI overrides.
+def parse_runtime_overrides(argv: list[str]) -> Dict[str, str]:
     overrides: Dict[str, str] = {}
     for arg in argv:
         if not arg.startswith("--"):
@@ -42,7 +50,7 @@ def parse_runtime_overrides(argv: list[str]) -> Dict[str, str]:  # Parse `--key=
     return overrides
 
 
-def cast_override_value(raw: str, existing: Any) -> Any:  # Cast raw override to match existing value type.
+def cast_override_value(raw: str, existing: Any) -> Any:
     existing_type = type(existing)
     if existing_type is bool:
         low = raw.lower()
@@ -62,20 +70,25 @@ def cast_override_value(raw: str, existing: Any) -> Any:  # Cast raw override to
     raise RuntimeError(f"unsupported override type {existing_type.__name__}")
 
 
-def apply_runtime_overrides(config: Dict[str, Any], overrides: Dict[str, str]) -> None:  # Apply CLI overrides to config.
+def apply_runtime_overrides(config: Dict[str, Any], overrides: Dict[str, str]) -> None:
     core_cfg = config["core"]["cfg"]
+    mission_cfg = core_cfg.get("mission") if type(core_cfg.get("mission")) is dict else None
     for key, raw_value in overrides.items():
         if key == "my_name":
             config["my_name"] = cast_override_value(raw_value, config["my_name"])
             if "my_name" in core_cfg:
                 core_cfg["my_name"] = cast_override_value(raw_value, core_cfg["my_name"])
             continue
-        if key not in core_cfg:
-            raise RuntimeError(f"override key not found in core.cfg {key}")
-        core_cfg[key] = cast_override_value(raw_value, core_cfg[key])
+        if key in core_cfg:
+            core_cfg[key] = cast_override_value(raw_value, core_cfg[key])
+            continue
+        if mission_cfg is not None and key in mission_cfg:
+            mission_cfg[key] = cast_override_value(raw_value, mission_cfg[key])
+            continue
+        raise RuntimeError(f"override key not found in core.cfg or core.cfg.mission {key}")
 
 
-def collect_named_scalars(node: Any, out: Dict[str, str]) -> None:  # Collect scalar values for `<token>` substitution.
+def collect_named_scalars(node: Any, out: Dict[str, str]) -> None:
     if type(node) is dict:
         for key, value in node.items():
             if type(value) in {str, int, float, bool}:
@@ -88,7 +101,7 @@ def collect_named_scalars(node: Any, out: Dict[str, str]) -> None:  # Collect sc
             collect_named_scalars(value, out)
 
 
-def resolve_placeholders(node: Any, values: Dict[str, str]) -> Any:  # Replace `<key>` placeholders in strings.
+def resolve_placeholders(node: Any, values: Dict[str, str]) -> Any:
     if type(node) is dict:
         return {key: resolve_placeholders(value, values) for key, value in node.items()}
     if type(node) is list:
@@ -104,10 +117,8 @@ def resolve_placeholders(node: Any, values: Dict[str, str]) -> Any:  # Replace `
     return node
 
 
-def deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:  # Recursively merge dict values where override wins.
-    merged: Dict[str, Any] = {}
-    for key, value in base.items():
-        merged[key] = value
+def deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    merged: Dict[str, Any] = dict(base)
     for key, value in override.items():
         if key in merged and type(merged[key]) is dict and type(value) is dict:
             merged[key] = deep_merge_dict(merged[key], value)
@@ -116,7 +127,7 @@ def deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str,
     return merged
 
 
-def apply_plugin_config_templates(config: Dict[str, Any], repo_root: Path) -> None:  # Merge plugin cfg overrides onto plugin config_template defaults.
+def apply_plugin_config_templates(config: Dict[str, Any], repo_root: Path) -> None:
     merged_plugins: list[Dict[str, Any]] = []
     for plugin_entry in config["plugins"]:
         plugin_name = plugin_entry["plugin"]
@@ -127,46 +138,47 @@ def apply_plugin_config_templates(config: Dict[str, Any], repo_root: Path) -> No
     config["plugins"] = merged_plugins
 
 
-def normalize_enum_token(value: str) -> str:  # Normalize enum-like config token for loose matching.
+def normalize_enum_token(value: str) -> str:
     return ENUM_TOKEN_RE.sub("", value).upper()
 
 
-def resolve_enum_value(raw_value: Any, enum_name: str, enum_values: Any) -> str:  # Resolve YAML enum-like string to canonical schema member.
+def resolve_enum_value(raw_value: Any, enum_type: Any) -> str:
     if type(raw_value) is not str:
-        raise RuntimeError(f"invalid enum value type enum={enum_name} type={type(raw_value).__name__}")
+        raise RuntimeError(f"invalid enum value type enum={enum_type.__name__} type={type(raw_value).__name__}")
     token = raw_value.strip()
     if "." in token:
-        prefix, member = token.split(".", 1)
-        if normalize_enum_token(prefix) != normalize_enum_token(enum_name):
-            raise RuntimeError(f"invalid enum prefix enum={enum_name} value={raw_value}")
-        token = member
+        _, token = token.rsplit(".", 1)
     normalized = normalize_enum_token(token)
-    members = vars(enum_values)
-    for member in members:
-        if normalize_enum_token(member) == normalized:
-            return member
-    raise RuntimeError(f"unknown enum value enum={enum_name} value={raw_value}")
+    normalized = ENUM_ALIASES.get(enum_type, {}).get(normalized, normalized)
+    for member in enum_type:
+        if normalize_enum_token(member.name) == normalized:
+            return member.name
+    raise RuntimeError(f"unknown OCCID enum value enum={enum_type.__name__} value={raw_value}")
 
 
-def resolve_enum_list(raw_values: Any, enum_name: str, enum_values: Any) -> list[str]:  # Resolve list of enum-like strings.
+def resolve_enum_list(raw_values: Any, enum_type: Any) -> list[str]:
     if type(raw_values) is not list:
-        raise RuntimeError(f"invalid enum list type enum={enum_name} type={type(raw_values).__name__}")
-    return [resolve_enum_value(raw_value, enum_name, enum_values) for raw_value in raw_values]
+        raise RuntimeError(f"invalid enum list type enum={enum_type.__name__} type={type(raw_values).__name__}")
+    return [resolve_enum_value(raw_value, enum_type) for raw_value in raw_values]
 
 
-def resolve_vehicle_config(config: Dict[str, Any]) -> Dict[str, str] | None:  # Resolve and validate runtime vehicle selection config.
+def resolve_vehicle_config(config: Dict[str, Any]) -> Dict[str, str] | None:
     vehicle = config.get("vehicle")
     if vehicle is None:
         return None
     if type(vehicle) is not dict:
         raise RuntimeError(f"invalid vehicle config type {type(vehicle).__name__}")
-    vehicle["autopilot"] = resolve_enum_value(vehicle["autopilot"], "FCAutopilotType", UAV.Enums.FCAutopilotType)
-    vehicle["uav_type"] = resolve_enum_value(vehicle["uav_type"], "UAVType", UAV.Enums.UAVType)
-    vehicle["telem_type"] = resolve_enum_value(vehicle["telem_type"], "TelemType", UAV.Enums.TelemType)
+    vehicle["autopilot"] = resolve_enum_value(vehicle["autopilot"], occid.AutopilotType)
+    raw_airframe = vehicle.get("airframe", vehicle.get("uav_type"))
+    if raw_airframe is None:
+        raise RuntimeError("vehicle config missing airframe")
+    vehicle["airframe"] = resolve_enum_value(raw_airframe, occid.AirframeType)
+    vehicle.pop("uav_type", None)
+    vehicle["telem_type"] = resolve_enum_value(vehicle["telem_type"], occid.TelemetryType)
     return vehicle
 
 
-def resolve_plugin_supports(config: Dict[str, Any]) -> None:  # Resolve plugin backend selector metadata against UAV enums.
+def resolve_plugin_supports(config: Dict[str, Any]) -> None:
     for plugin_entry in config["plugins"]:
         plugin_cfg = plugin_entry["cfg"]
         supports = plugin_cfg.get("supports")
@@ -174,22 +186,25 @@ def resolve_plugin_supports(config: Dict[str, Any]) -> None:  # Resolve plugin b
             continue
         if type(supports) is not dict:
             raise RuntimeError(f"invalid supports config type plugin={plugin_entry['plugin']} type={type(supports).__name__}")
-        supports["autopilot"] = resolve_enum_list(supports["autopilot"], "FCAutopilotType", UAV.Enums.FCAutopilotType)
-        supports["telem_type"] = resolve_enum_list(supports["telem_type"], "TelemType", UAV.Enums.TelemType)
+        supports["autopilot"] = resolve_enum_list(supports["autopilot"], occid.AutopilotType)
+        supports["telem_type"] = resolve_enum_list(supports["telem_type"], occid.TelemetryType)
 
 
-def plugin_supports_vehicle(plugin_cfg: Dict[str, Any], vehicle: Dict[str, str]) -> bool:  # Check whether plugin selector metadata matches vehicle config.
+def plugin_supports_vehicle(plugin_cfg: Dict[str, Any], vehicle: Dict[str, str]) -> bool:
     supports = plugin_cfg.get("supports")
     if type(supports) is not dict:
         return False
     return vehicle["autopilot"] in supports["autopilot"] and vehicle["telem_type"] in supports["telem_type"]
 
 
-def configure_runtime_plugins(config: Dict[str, Any], vehicle: Dict[str, str] | None) -> None:  # Bind core to controller/backend plugins after template merge and enum resolution.
+def configure_runtime_plugins(config: Dict[str, Any], vehicle: Dict[str, str] | None) -> None:
     plugins_raw = config["plugins"]
     core_cfg = config["core"]["cfg"]
     if vehicle is not None:
         core_cfg["vehicle"] = dict(vehicle)
+
+    # Controller plugins remain supported for legacy/non-flight configurations,
+    # but OCCID-native flight cores should bind directly to their endpoint adapter.
     controller_plugins = [entry for entry in plugins_raw if entry.get("cfg", {}).get("is_controller")]
     if len(controller_plugins) > 1:
         raise RuntimeError(f"multiple controller plugins configured count={len(controller_plugins)}")
@@ -220,15 +235,22 @@ def configure_runtime_plugins(config: Dict[str, Any], vehicle: Dict[str, str] | 
             raise RuntimeError(f"core interface must target controller expected={expected_interface} actual={core_cfg['interface']}")
         core_cfg["interface"] = expected_interface
         return
+
     if "interface" in core_cfg:
         return
     interface_plugins = [entry for entry in plugins_raw if entry.get("cfg", {}).get("is_interface")]
+    if vehicle is not None:
+        interface_plugins = [entry for entry in interface_plugins if plugin_supports_vehicle(entry["cfg"], vehicle)]
     if len(interface_plugins) == 1:
         intf_cfg = interface_plugins[0]["cfg"]
         core_cfg["interface"] = {"id": intf_cfg["id"], "topic_ns": intf_cfg["topic_ns"]}
         return
     if len(interface_plugins) > 1:
-        raise RuntimeError("multiple interface plugins require explicit core.cfg.interface or one controller plugin")
+        raise RuntimeError("multiple interface plugins require explicit core.cfg.interface or one matching vehicle backend")
+    if vehicle is not None:
+        raise RuntimeError(
+            f"no interface plugin supports autopilot={vehicle['autopilot']} telem_type={vehicle['telem_type']}"
+        )
 
 
 def start_from_config(config_path: Path, overrides: Dict[str, str]) -> None:
@@ -266,8 +288,13 @@ def start_from_config(config_path: Path, overrides: Dict[str, str]) -> None:
     else:
         endpoint = endpoint_cfg
     instance_name = config["core"]["cfg"].get("my_name", config["my_name"])
-    topic_prefix = f"hiveos/{instance_name}"
-    bus_config = {"schema_path": str(schema_path), "log_file": str(log_file), "endpoint": endpoint, "topic_prefix": topic_prefix}
+    topic_prefix = f"mpfc/{instance_name}"
+    bus_config = {
+        "schema_path": str(schema_path),
+        "log_file": str(log_file),
+        "endpoint": endpoint,
+        "topic_prefix": topic_prefix,
+    }
 
     log_fd = os.open(str(log_file), os.O_WRONLY | os.O_CREAT | os.O_APPEND)
     log_handle = os.fdopen(log_fd, "a", buffering=1)
