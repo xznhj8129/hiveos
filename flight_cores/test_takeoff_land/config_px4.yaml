@@ -10,7 +10,6 @@ core:
   cfg:
     id: mav_core
     mav_port: 14540
-
     mission:
       takeoff_altitude_m: 10.0
       takeoff_altitude_ok_fraction: 0.8
@@ -29,24 +28,11 @@ core:
       land_timeout_s: 120.0
       state_timeout_s: 60.0
       response_timeout_s: 20.0
-
     state_keys:
-    - IsHomePositionOk
-    - IsGlobalPositionOk
-    - IsArmed
-    - IsInAir
-    - AltitudeM
-    - Position
-    - SensorConfig
-    - ActiveModeNames
-
-    state_logging:
-      keys:
-      - IsInAir
-      - IsArmed
-      - AltitudeM
-      interval_s: 0.5
-      prefix: CORE
+    - flight_control
+    - location
+    - attitude
+    - angular_velocity
 
 bus_config:
   schema_path: ../../config/bus_topics_schema.json
@@ -61,7 +47,6 @@ plugins:
   cfg:
     id: px4_sitl
     auto_start: true
-
     px4:
       px4_dir: "../../px4dev/PX4-Autopilot/"
       sitl_vehicle: "gz_x500_mono_cam"
@@ -73,20 +58,12 @@ plugins:
       home_lon: -83.218791
       home_alt: 0
       model_pose: ""
-
     gazebo:
       gz_world: "default"
       gz_ip: 127.0.0.1
       gz_gui: true
       video_host_ip: 127.0.0.1
       video_host_port: 5601
-    
-- plugin: uav_controller
-  cfg:
-    id: uav_controller
-    topic_ns: UAV
-    poll_interval_s: 0.1
-    response_timeout_s: 20.0
 
 - plugin: mavsdk_interface
   cfg:
@@ -100,21 +77,10 @@ plugins:
     mav_sysid: 1
     mavsdk_log_debug: false
     state_intervals:
-      IsInAir: 0.1
-      IsArmed: 0.1
-      IsHomePositionOk: 0.5
-      IsGlobalPositionOk: 0.5
-      AltitudeM: 0.1
-      Position: 0.2
-      AttitudeRad: 0.1
-      AngVelRadS: 0.1
-      FixType: 0.5
-      NumSat: 0.5
-      GpsInfo: 0.5
-      RawGps: 0.5
-      Battery: 0.5
-      Imu: 0.1
-      FcInfo: 1.0
-      FlightMode: 0.2
-      SensorConfig: 1.0
-      ActiveModeNames: 0.2
+      flight_control: 0.1
+      location: 0.1
+      attitude: 0.1
+      angular_velocity: 0.1
+      gnss: 0.5
+      power: 0.5
+      firmware: 1.0
