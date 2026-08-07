@@ -5,10 +5,10 @@ cfg:
   is_interface: true
   supports:
     autopilot:
-    - FCAutopilotType.PX4
-    - FCAutopilotType.Ardupilot
+    - AutopilotType.PX4
+    - AutopilotType.ARDUPILOT
     telem_type:
-    - TelemType.Mavlink2
+    - TelemetryType.MAVLINK
   conn_type: udp
   conn_str: udp://:14550
   mav_dialect: PX4
