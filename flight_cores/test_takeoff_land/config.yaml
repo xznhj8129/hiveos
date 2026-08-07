@@ -39,6 +39,12 @@ bus_config:
     host: 127.0.0.1
     port: 1883
 plugins:
+- plugin: uav_controller
+  cfg:
+    id: uav_controller
+    topic_ns: UAV
+    poll_interval_s: 0.1
+    response_timeout_s: 20.0
 - plugin: mavsdk_interface
   cfg:
     id: mavsdk
