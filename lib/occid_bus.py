@@ -8,6 +8,7 @@ second representation of OCCID.
 from __future__ import annotations
 
 import base64
+import importlib
 import os
 import sys
 from pathlib import Path
@@ -16,13 +17,24 @@ from typing import Any
 import msgpack
 
 
+def _is_occid_schema(module: Any) -> bool:
+    return hasattr(module, "OCCIDModel") and hasattr(module, "OCCID_MODEL_BY_ID")
+
+
 def _load_occid_schema():
     try:
-        import schema as candidate
-        if hasattr(candidate, "OCCIDModel") and hasattr(candidate, "OCCID_MODEL_BY_ID"):
+        candidate = importlib.import_module("schema")
+        if _is_occid_schema(candidate):
             return candidate
     except ImportError:
         pass
+
+    # A third-party package named `schema` is common. If one was imported above,
+    # remove only that non-OCCID module before trying the explicitly configured
+    # OCCID repository/package paths.
+    existing = sys.modules.get("schema")
+    if existing is not None and not _is_occid_schema(existing):
+        sys.modules.pop("schema", None)
 
     candidates: list[Path] = []
     configured = os.environ.get("OCCID_PATH")
@@ -37,11 +49,13 @@ def _load_occid_schema():
         if path_text not in sys.path:
             sys.path.insert(0, path_text)
         try:
-            import schema as candidate
+            candidate = importlib.import_module("schema")
         except ImportError:
+            sys.modules.pop("schema", None)
             continue
-        if hasattr(candidate, "OCCIDModel") and hasattr(candidate, "OCCID_MODEL_BY_ID"):
+        if _is_occid_schema(candidate):
             return candidate
+        sys.modules.pop("schema", None)
 
     searched = ", ".join(str(path) for path in candidates)
     raise RuntimeError(
