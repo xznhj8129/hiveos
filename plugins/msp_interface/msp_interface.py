@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import math
 import queue
 import threading
 import time
@@ -14,6 +13,16 @@ from mspapi2.lib import InavEnums, boxes
 from mspapi2.msp_api import MSPApi
 from mspapi2.msp_serial import MSPSerial
 
+from interop.common import normalized_to_pwm
+from interop.msp import (
+    InavGpsFields,
+    angular_velocity_from_fru_degrees_s,
+    attitude_from_degrees,
+    gps_to_occid,
+    rc_pwm_mapping_to_control_axes,
+    rc_sequence_to_control_axes,
+    standard_mode_from_native_names,
+)
 from lib.common import apply_cfg, build_request_topic, build_response_topic, build_state_scheduler_topics, build_topic_base
 from lib.occid_bus import decode_occid_command, occid, pack_occid
 from lib.occid_topics import (
@@ -30,9 +39,7 @@ from lib.occid_topics import (
     RUNTIME_LOAD,
 )
 from lib.plugin_base import PluginBase
-from lib.reference_frames import fru_to_frd_vector
 from lib.state_scheduler import StateScheduler
-from lib.uav import scale_float_pwm, scale_pwm_float
 
 REQUEST_QUEUE_TIMEOUT_S = 0.05
 POLL_INTERVAL_S = 0.1
@@ -40,40 +47,6 @@ POLL_INTERVAL_S = 0.1
 
 class UnsupportedCommand(RuntimeError):
     pass
-
-
-def _standard_mode(native_names: list[str]) -> Any:
-    names = {name.upper().replace("_", " ") for name in native_names}
-    if any(name in names for name in {"NAV POSHOLD", "POSHOLD", "LOITER"}):
-        return occid.StandardFlightMode.POSITION_HOLD
-    if any(name in names for name in {"RTH", "NAV RTH"}):
-        return occid.StandardFlightMode.SAFE_RECOVERY
-    if any(name in names for name in {"NAV WP", "MISSION"}):
-        return occid.StandardFlightMode.MISSION
-    if any(name in names for name in {"NAV LAND", "LAND"}):
-        return occid.StandardFlightMode.LAND
-    if any(name in names for name in {"NAV CRUISE", "CRUISE"}):
-        return occid.StandardFlightMode.CRUISE
-    if any(name in names for name in {"ALT HOLD", "ALTHOLD"}):
-        return occid.StandardFlightMode.ALTITUDE_HOLD
-    return occid.StandardFlightMode.NON_STANDARD
-
-
-def _gnss_fix_type(fix: Any) -> Any:
-    name = getattr(fix, "name", str(fix)).upper()
-    if "RTK_FIXED" in name:
-        return occid.GnssFixType.RTK_FIXED
-    if "RTK_FLOAT" in name:
-        return occid.GnssFixType.RTK_FLOAT
-    if "DGPS" in name:
-        return occid.GnssFixType.DGPS
-    if "3D" in name:
-        return occid.GnssFixType.FIX_3D
-    if "2D" in name:
-        return occid.GnssFixType.FIX_2D
-    if "NO_FIX" in name or "NONE" in name:
-        return occid.GnssFixType.NO_FIX
-    return occid.GnssFixType.NONE
 
 
 class MspInterface(PluginBase):
@@ -231,27 +204,24 @@ class MspInterface(PluginBase):
 
     def _rc_telemetry(self, rc_channels: Any) -> Any:
         if type(rc_channels) is dict:
-            aux: list[float] = []
             primary_names = set(self.override_channels.values())
-            for channel_name in self.api.chmap[4:]:
-                if channel_name in primary_names or channel_name not in rc_channels:
-                    continue
-                aux.append(scale_pwm_float(rc_channels[channel_name], self.rx_config["rxMinUsec"], self.rx_config["rxMaxUsec"]))
-            return occid.ControlAxisSet(
-                roll=scale_pwm_float(rc_channels[self.override_channels["roll"]], self.rx_config["rxMinUsec"], self.rx_config["rxMaxUsec"]),
-                pitch=scale_pwm_float(rc_channels[self.override_channels["pitch"]], self.rx_config["rxMinUsec"], self.rx_config["rxMaxUsec"]),
-                yaw=scale_pwm_float(rc_channels[self.override_channels["yaw"]], self.rx_config["rxMinUsec"], self.rx_config["rxMaxUsec"]),
-                throttle=scale_pwm_float(rc_channels[self.override_channels["throt"]], self.rx_config["rxMinUsec"], self.rx_config["rxMaxUsec"]),
-                aux=aux,
+            aux_channels = [
+                channel_name
+                for channel_name in self.api.chmap[4:]
+                if channel_name not in primary_names and channel_name in rc_channels
+            ]
+            return rc_pwm_mapping_to_control_axes(
+                rc_channels,
+                roll_channel=self.override_channels["roll"],
+                pitch_channel=self.override_channels["pitch"],
+                yaw_channel=self.override_channels["yaw"],
+                throttle_channel=self.override_channels["throt"],
+                aux_channels=aux_channels,
+                pwm_min_us=self.rx_config["rxMinUsec"],
+                pwm_max_us=self.rx_config["rxMaxUsec"],
             )
-        if type(rc_channels) is list and len(rc_channels) >= 4:
-            return occid.ControlAxisSet(
-                roll=float(rc_channels[0]),
-                pitch=float(rc_channels[1]),
-                yaw=float(rc_channels[3]),
-                throttle=float(rc_channels[2]),
-                aux=[float(value) for value in rc_channels[4:]],
-            )
+        if type(rc_channels) is list:
+            return rc_sequence_to_control_axes(rc_channels)
         raise RuntimeError(f"unsupported rc_channels type {type(rc_channels).__name__}")
 
     def _override_is_fresh(self) -> bool:
@@ -288,12 +258,16 @@ class MspInterface(PluginBase):
         for field, channel_name in primary.items():
             value = getattr(override, field)
             if value is not None:
-                channels[channel_name] = scale_float_pwm(float(value), self.rx_config["rxMinUsec"], self.rx_config["rxMaxUsec"])
+                channels[channel_name] = normalized_to_pwm(
+                    float(value), self.rx_config["rxMinUsec"], self.rx_config["rxMaxUsec"]
+                )
         for aux in override.aux:
             index = 4 + int(aux.channel_index)
             if aux.value is None or index >= len(self.api.chmap):
                 continue
-            channels[self.api.chmap[index]] = scale_float_pwm(float(aux.value), self.rx_config["rxMinUsec"], self.rx_config["rxMaxUsec"])
+            channels[self.api.chmap[index]] = normalized_to_pwm(
+                float(aux.value), self.rx_config["rxMinUsec"], self.rx_config["rxMaxUsec"]
+            )
         return channels
 
     def _refresh_state(self) -> None:
@@ -341,7 +315,7 @@ class MspInterface(PluginBase):
             in_air=is_in_air,
             override_active=override_active,
             failsafe=failsafe,
-            standard_mode=_standard_mode(active_mode_names),
+            standard_mode=standard_mode_from_native_names(active_mode_names),
             native_mode_name=active_mode_names[0] if active_mode_names else None,
             native_active_mode_codes=active_mode_ids,
             native_active_mode_names=active_mode_names,
@@ -355,70 +329,45 @@ class MspInterface(PluginBase):
         self._publish_model(RUNTIME_LOAD, runtime_load)
 
         absolute_alt_m = gps.get("altitude")
-        location = occid.LocationState(
-            inertial_frame=occid.InertialReferenceFrame.NED,
-            body_frame=occid.BodyReferenceFrame.FRD,
-            position=occid.GlobalPosition(
-                lat=float(gps["latitude"]),
-                lon=float(gps["longitude"]),
-                alt=float(absolute_alt_m or 0.0),
-                alt_frame=occid.AltitudeDatum.SEA_LEVEL,
-            ),
-            altitude=occid.AltitudeState(
-                absolute_m=None if absolute_alt_m is None else float(absolute_alt_m),
-                relative_m=None if relative_alt_m is None else float(relative_alt_m),
-                datum=occid.AltitudeDatum.RELATIVE,
+        native_fix = gps["fixType"]
+        fix_code = getattr(native_fix, "value", native_fix)
+        location, gnss = gps_to_occid(
+            InavGpsFields(
+                latitude_deg=float(gps["latitude"]),
+                longitude_deg=float(gps["longitude"]),
+                absolute_altitude_m=None if absolute_alt_m is None else float(absolute_alt_m),
+                relative_altitude_m=None if relative_alt_m is None else float(relative_alt_m),
+                fix_name=getattr(native_fix, "name", str(native_fix)),
+                fix_code=int(fix_code),
+                satellites_used=int(gps["numSat"]),
+                ground_speed_m_s=None if gps.get("speed") is None else float(gps["speed"]),
+                ground_course_deg=None if gps.get("groundCourse") is None else float(gps["groundCourse"]),
+                hdop=None if gps.get("hdop") is None else float(gps["hdop"]),
             ),
             navigation_validity=nav_validity,
         )
         self.latest_location = location
         self._publish_model(LOCATION, location)
+        self._publish_model(GNSS, gnss)
 
-        attitude_state = occid.EulerAngles(
-            roll_rad=math.radians(float(attitude["roll"])),
-            pitch_rad=math.radians(float(attitude["pitch"])),
-            yaw_rad=math.radians(float(attitude["yaw"])),
-            body_frame=occid.BodyReferenceFrame.FRD,
-            reference_frame=occid.InertialReferenceFrame.NED,
+        attitude_state = attitude_from_degrees(
+            float(attitude["roll"]),
+            float(attitude["pitch"]),
+            float(attitude["yaw"]),
         )
         self._publish_model(ATTITUDE, attitude_state)
 
         gyro = imu["gyro"]
-        gyro_x, gyro_y, gyro_z = fru_to_frd_vector(
-            math.radians(float(gyro["X"])),
-            math.radians(float(gyro["Y"])),
-            math.radians(float(gyro["Z"])),
-        )
-        angular_velocity = occid.AngularVelocityVector(
-            x_rad_s=gyro_x,
-            y_rad_s=gyro_y,
-            z_rad_s=gyro_z,
-            frame=occid.BodyReferenceFrame.FRD,
+        angular_velocity = angular_velocity_from_fru_degrees_s(
+            float(gyro["X"]),
+            float(gyro["Y"]),
+            float(gyro["Z"]),
         )
         self._publish_model(ANGULAR_VELOCITY, angular_velocity)
         self._publish_model(
             IMU,
             occid.ImuSample(angular_velocity=angular_velocity, frame=occid.BodyReferenceFrame.FRD),
         )
-
-        native_fix = gps["fixType"]
-        fix_code = getattr(native_fix, "value", native_fix)
-        gnss = occid.GnssSolution(
-            fix_type=_gnss_fix_type(native_fix),
-            fix_code=int(fix_code),
-            satellites_used=int(gps["numSat"]),
-            position=occid.GlobalPosition(
-                lat=float(gps["latitude"]),
-                lon=float(gps["longitude"]),
-                alt=float(absolute_alt_m or 0.0),
-                alt_frame=occid.AltitudeDatum.SEA_LEVEL,
-            ),
-            altitude=location.altitude,
-            ground_speed_ms=None if gps.get("speed") is None else float(gps["speed"]),
-            ground_course_deg=None if gps.get("groundCourse") is None else float(gps["groundCourse"]),
-            hdop=None if gps.get("hdop") is None else float(gps["hdop"]),
-        )
-        self._publish_model(GNSS, gnss)
 
         power = occid.ElectricalResourceState(
             voltage_v=analog.get("vbat"),
