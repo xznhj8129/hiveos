@@ -21,13 +21,8 @@ plugins:
     topic_ns: ATAK
     is_interface: true
     state_intervals:
-      TcpClientConnected: 0.1
-      LastEvent: 0.1
-      LastResult: 0.1
-      LastError: 0.1
-      RxCount: 0.1
-      TxCount: 0.1
-      RxParseErrors: 0.1
+      entity_state: 0.05
+      cot_raw: 0.05
     loop_interval_s: 0.1
     bus_poll_interval_s: 0.01
     recv_buffer_bytes: 65535
@@ -52,5 +47,5 @@ plugins:
       stale_seconds: 60
       default_ce: 50.0
       default_le: 50.0
-      self_callsign: HIVEOS
+      self_callsign: MPFC
       self_cottype: a-f-U
