@@ -8,6 +8,9 @@ representation conversion lives in the OCCID SDK interop layer.
 
 from typing import Any, Dict
 
+# Importing occid_bus resolves OCCID_PATH / the sibling OCCID checkout before
+# importing SDK interop modules, so these helpers also work outside main.py.
+from lib.occid_bus import occid as _occid  # noqa: F401
 from interop.common import fru_to_frd_vector as _occid_fru_to_frd_vector
 
 FRAME_FRD = "FRD"
