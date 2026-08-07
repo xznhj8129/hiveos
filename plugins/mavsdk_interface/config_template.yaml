@@ -16,12 +16,8 @@ cfg:
   mav_sysid: 1
   mavsdk_log_debug: false
 
-  # Readiness stabilization remains endpoint policy, but is reported as OCCID NavReadinessState.
-  arm_ready_hold_s: 0.5
-  takeoff_ready_hold_s: 0.5
-  ardupilot_arm_ready_hold_s: 2.0
-  ardupilot_takeoff_ready_hold_s: 3.0
-
+  # Endpoint adapter reports raw OCCID health/readiness facts. Stabilization and
+  # vehicle-level arm/takeoff readiness policy belongs to uav_controller.
   consume_control_override: false
   control_override_timeout_s: 0.3
   control_override_send_interval_s: 0.05
