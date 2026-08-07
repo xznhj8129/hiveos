@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import math
 import queue
 import threading
 import time
@@ -19,6 +18,16 @@ from mavsdk.action import ActionError
 from mavsdk.info import InfoError
 from mavsdk.offboard import Attitude, OffboardError
 
+from interop.common import radians_to_degrees
+from interop.mavsdk import (
+    MavsdkPositionFields,
+    angular_velocity_from_body_rates,
+    attitude_from_euler_degrees,
+    attitude_setpoint_to_fields,
+    gnss_fix_type_from_native_value,
+    position_to_location_state,
+    standard_mode_from_native_name,
+)
 from lib.common import apply_cfg, build_request_topic, build_response_topic, build_state_scheduler_topics, build_topic_base
 from lib.occid_bus import decode_occid_command, occid, pack_occid
 from lib.occid_topics import (
@@ -42,44 +51,6 @@ POLL_INTERVAL_S = 0.1
 
 class UnsupportedCommand(RuntimeError):
     pass
-
-
-def _standard_mode(native_name: str) -> Any:
-    name = native_name.upper()
-    mapping = {
-        "HOLD": occid.StandardFlightMode.POSITION_HOLD,
-        "POSCTL": occid.StandardFlightMode.POSITION_HOLD,
-        "POSHOLD": occid.StandardFlightMode.POSITION_HOLD,
-        "LOITER": occid.StandardFlightMode.POSITION_HOLD,
-        "ORBIT": occid.StandardFlightMode.ORBIT,
-        "CRUISE": occid.StandardFlightMode.CRUISE,
-        "ALTCTL": occid.StandardFlightMode.ALTITUDE_HOLD,
-        "ALT_HOLD": occid.StandardFlightMode.ALTITUDE_HOLD,
-        "RETURN_TO_LAUNCH": occid.StandardFlightMode.SAFE_RECOVERY,
-        "RTL": occid.StandardFlightMode.SAFE_RECOVERY,
-        "RTH": occid.StandardFlightMode.SAFE_RECOVERY,
-        "MISSION": occid.StandardFlightMode.MISSION,
-        "AUTO_MISSION": occid.StandardFlightMode.MISSION,
-        "LAND": occid.StandardFlightMode.LAND,
-        "LANDING": occid.StandardFlightMode.LAND,
-        "TAKEOFF": occid.StandardFlightMode.TAKEOFF,
-        "OFFBOARD": occid.StandardFlightMode.EXTERNAL_CONTROL,
-        "GUIDED": occid.StandardFlightMode.EXTERNAL_CONTROL,
-    }
-    return mapping.get(name, occid.StandardFlightMode.NON_STANDARD)
-
-
-def _gnss_fix_type(native_value: int) -> Any:
-    mapping = {
-        0: occid.GnssFixType.NONE,
-        1: occid.GnssFixType.NO_FIX,
-        2: occid.GnssFixType.FIX_2D,
-        3: occid.GnssFixType.FIX_3D,
-        4: occid.GnssFixType.DGPS,
-        5: occid.GnssFixType.RTK_FLOAT,
-        6: occid.GnssFixType.RTK_FIXED,
-    }
-    return mapping.get(int(native_value), occid.GnssFixType.NONE)
 
 
 class MavsdkInterface(PluginBase):
@@ -128,8 +99,6 @@ class MavsdkInterface(PluginBase):
             navigation_validity=self.nav_validity,
             readiness=self.readiness,
         )
-        self.arm_ready_since: float | None = None
-        self.takeoff_ready_since: float | None = None
 
         initial = dict(self.control_output_initial)
         self.control_output = occid.ControlAxisSet(
@@ -157,6 +126,9 @@ class MavsdkInterface(PluginBase):
         self.flight_control = self.flight_control.model_copy(update=updates)
         self._publish_model(FLIGHT_CONTROL, self.flight_control)
 
+    def _publish_raw_readiness(self) -> None:
+        self._publish_flight_control(readiness=self.readiness, navigation_validity=self.nav_validity)
+
     def _override_is_fresh(self) -> bool:
         if self.control_override is None:
             return False
@@ -180,46 +152,6 @@ class MavsdkInterface(PluginBase):
         update["aux"] = aux
         return self.control_output.model_copy(update=update)
 
-    def _recompute_readiness(self) -> None:
-        armable = bool(self.readiness.armable)
-        takeoff_candidate = (
-            armable
-            and self.location_state is not None
-            and bool(self.nav_validity.local_position_ok)
-            and bool(self.nav_validity.global_position_ok)
-            and bool(self.nav_validity.home_position_ok)
-        )
-        arm_hold_s = float(self.arm_ready_hold_s)
-        takeoff_hold_s = float(self.takeoff_ready_hold_s)
-        if self.is_ardupilot:
-            arm_hold_s = float(self.ardupilot_arm_ready_hold_s)
-            takeoff_hold_s = float(self.ardupilot_takeoff_ready_hold_s)
-            takeoff_candidate = takeoff_candidate and bool(self.readiness.ekf_using_gps)
-
-        now = time.monotonic()
-        if armable:
-            if self.arm_ready_since is None:
-                self.arm_ready_since = now
-        else:
-            self.arm_ready_since = None
-        if takeoff_candidate:
-            if self.takeoff_ready_since is None:
-                self.takeoff_ready_since = now
-        else:
-            self.takeoff_ready_since = None
-
-        self.readiness = self.readiness.model_copy(
-            update={
-                "arm_ready": armable and self.arm_ready_since is not None and now - self.arm_ready_since >= arm_hold_s,
-                "takeoff_ready": (
-                    takeoff_candidate
-                    and self.takeoff_ready_since is not None
-                    and now - self.takeoff_ready_since >= takeoff_hold_s
-                ),
-            }
-        )
-        self._publish_flight_control(readiness=self.readiness, navigation_validity=self.nav_validity)
-
     def _respond(self, request_id: str, command: Any, ok: bool, data: Dict[str, Any] | None = None, error: str | None = None) -> None:
         payload = {} if data is None else dict(data)
         if error is not None:
@@ -234,14 +166,6 @@ class MavsdkInterface(PluginBase):
                 await asyncio.sleep(POLL_INTERVAL_S)
                 continue
             await self._handle_command(request)
-
-    def _require_attitude_frames(self, setpoint: Any) -> None:
-        if setpoint.body_frame != occid.BodyReferenceFrame.FRD:
-            raise UnsupportedCommand(f"attitude control requires body_frame=FRD actual={setpoint.body_frame}")
-        if setpoint.reference_frame != occid.InertialReferenceFrame.NED:
-            raise UnsupportedCommand(
-                f"attitude control requires reference_frame=NED actual={setpoint.reference_frame}"
-            )
 
     async def _handle_set_mode(self, command: Any) -> None:
         mode = command.standard_mode
@@ -288,9 +212,9 @@ class MavsdkInterface(PluginBase):
                 else:
                     raise UnsupportedCommand(f"unsupported GoTo altitude datum {position.alt_frame}")
                 if command.yaw_rad is not None:
-                    yaw_deg = math.degrees(float(command.yaw_rad))
+                    yaw_deg = radians_to_degrees(float(command.yaw_rad), "yaw_rad")
                 elif self.last_attitude is not None:
-                    yaw_deg = math.degrees(float(self.last_attitude.yaw_rad))
+                    yaw_deg = radians_to_degrees(float(self.last_attitude.yaw_rad), "yaw_rad")
                 else:
                     yaw_deg = 0.0
                 await self.drone.action.goto_location(
@@ -300,13 +224,13 @@ class MavsdkInterface(PluginBase):
                 await self._handle_set_mode(command)
             elif isinstance(command, occid.SetControlAttitudeCommand):
                 setpoint = command.setpoint
-                self._require_attitude_frames(setpoint)
+                fields = attitude_setpoint_to_fields(setpoint)
                 await self.drone.offboard.set_attitude(
                     Attitude(
-                        math.degrees(float(setpoint.roll_rad)),
-                        math.degrees(float(setpoint.pitch_rad)),
-                        math.degrees(float(setpoint.yaw_rad)),
-                        float(setpoint.thrust_normalized),
+                        fields.roll_deg,
+                        fields.pitch_deg,
+                        fields.yaw_deg,
+                        fields.thrust_value,
                     )
                 )
                 self._publish_flight_control(attitude_setpoint=setpoint)
@@ -376,7 +300,7 @@ class MavsdkInterface(PluginBase):
                     "can_arm_or_run": bool(health.is_armable),
                 }
             )
-            self._recompute_readiness()
+            self._publish_raw_readiness()
             if self.stop_event.is_set():
                 return
 
@@ -387,7 +311,7 @@ class MavsdkInterface(PluginBase):
                 if not self.readiness.ekf_using_gps:
                     print(f"[PLUGIN] {self.client_id} ardupilot_status_text text={text}", flush=True)
                 self.readiness = self.readiness.model_copy(update={"ekf_using_gps": True})
-                self._recompute_readiness()
+                self._publish_raw_readiness()
             if self.stop_event.is_set():
                 return
 
@@ -395,35 +319,25 @@ class MavsdkInterface(PluginBase):
         async for position in self.drone.telemetry.position():
             self.last_abs_alt_m = float(position.absolute_altitude_m)
             self.last_rel_alt_m = float(position.relative_altitude_m)
-            self.location_state = occid.LocationState(
-                inertial_frame=occid.InertialReferenceFrame.NED,
-                body_frame=occid.BodyReferenceFrame.FRD,
-                position=occid.GlobalPosition(
-                    lat=float(position.latitude_deg),
-                    lon=float(position.longitude_deg),
-                    alt=float(position.absolute_altitude_m),
-                    alt_frame=occid.AltitudeDatum.SEA_LEVEL,
-                ),
-                altitude=occid.AltitudeState(
-                    absolute_m=float(position.absolute_altitude_m),
-                    relative_m=float(position.relative_altitude_m),
-                    datum=occid.AltitudeDatum.RELATIVE,
+            self.location_state = position_to_location_state(
+                MavsdkPositionFields(
+                    latitude_deg=float(position.latitude_deg),
+                    longitude_deg=float(position.longitude_deg),
+                    absolute_altitude_m=self.last_abs_alt_m,
+                    relative_altitude_m=self.last_rel_alt_m,
                 ),
                 navigation_validity=self.nav_validity,
             )
             self._publish_model(LOCATION, self.location_state)
-            self._recompute_readiness()
             if self.stop_event.is_set():
                 return
 
     async def _watch_attitude(self) -> None:
         async for attitude in self.drone.telemetry.attitude_euler():
-            self.last_attitude = occid.EulerAngles(
-                roll_rad=math.radians(float(attitude.roll_deg)),
-                pitch_rad=math.radians(float(attitude.pitch_deg)),
-                yaw_rad=math.radians(float(attitude.yaw_deg)),
-                body_frame=occid.BodyReferenceFrame.FRD,
-                reference_frame=occid.InertialReferenceFrame.NED,
+            self.last_attitude = attitude_from_euler_degrees(
+                float(attitude.roll_deg),
+                float(attitude.pitch_deg),
+                float(attitude.yaw_deg),
             )
             self._publish_model(ATTITUDE, self.last_attitude)
             if self.stop_event.is_set():
@@ -431,11 +345,10 @@ class MavsdkInterface(PluginBase):
 
     async def _watch_angular_velocity(self) -> None:
         async for velocity in self.drone.telemetry.attitude_angular_velocity_body():
-            state = occid.AngularVelocityVector(
-                x_rad_s=float(velocity.roll_rad_s),
-                y_rad_s=float(velocity.pitch_rad_s),
-                z_rad_s=float(velocity.yaw_rad_s),
-                frame=occid.BodyReferenceFrame.FRD,
+            state = angular_velocity_from_body_rates(
+                float(velocity.roll_rad_s),
+                float(velocity.pitch_rad_s),
+                float(velocity.yaw_rad_s),
             )
             self._publish_model(ANGULAR_VELOCITY, state)
             if self.stop_event.is_set():
@@ -446,7 +359,7 @@ class MavsdkInterface(PluginBase):
             native_fix = gps_info.fix_type.value if hasattr(gps_info.fix_type, "value") else gps_info.fix_type
             self.gnss_state = self.gnss_state.model_copy(
                 update={
-                    "fix_type": _gnss_fix_type(int(native_fix)),
+                    "fix_type": gnss_fix_type_from_native_value(int(native_fix)),
                     "fix_code": int(native_fix),
                     "satellites_used": int(gps_info.num_satellites),
                 }
@@ -497,7 +410,7 @@ class MavsdkInterface(PluginBase):
             mode_name = flight_mode.name if hasattr(flight_mode, "name") else str(flight_mode)
             self.readiness = self.readiness.model_copy(update={"mode_name": mode_name})
             self._publish_flight_control(
-                standard_mode=_standard_mode(mode_name),
+                standard_mode=standard_mode_from_native_name(mode_name),
                 native_mode_name=mode_name,
                 native_active_mode_names=[mode_name],
                 readiness=self.readiness,
@@ -510,11 +423,10 @@ class MavsdkInterface(PluginBase):
             # Acceleration/magnetic vectors are intentionally omitted until OCCID has
             # a body-frame linear-vector type. Do not mislabel FRD data as inertial.
             state = occid.ImuSample(
-                angular_velocity=occid.AngularVelocityVector(
-                    x_rad_s=float(imu.angular_velocity_frd.forward_rad_s),
-                    y_rad_s=float(imu.angular_velocity_frd.right_rad_s),
-                    z_rad_s=float(imu.angular_velocity_frd.down_rad_s),
-                    frame=occid.BodyReferenceFrame.FRD,
+                angular_velocity=angular_velocity_from_body_rates(
+                    float(imu.angular_velocity_frd.forward_rad_s),
+                    float(imu.angular_velocity_frd.right_rad_s),
+                    float(imu.angular_velocity_frd.down_rad_s),
                 ),
                 temperature_deg_c=float(imu.temperature_degc),
                 timestamp_us=int(imu.timestamp_us),
