@@ -1,27 +1,19 @@
 #!/usr/bin/env python3
-"""
-Usage:
-    from flight_cores.test_takeoff_land.test_takeoff_land import run_core
-    run_core(cfg, bus_config)
-"""
+"""OCCID-native takeoff/goto/RTL/land acceptance program."""
 
+from __future__ import annotations
+
+import math
 import time
 import traceback
 from typing import Any, Dict
 
-from lib.common import (
-    apply_cfg,
-    build_envelope,
-    build_request_topic,
-    build_response_topic,
-    build_state_topics,
-    build_topic_base,
-)
+from lib.common import apply_cfg, build_envelope
 from lib.core_base import CoreBase
 from lib.geo_utils import GPSposition, gps_distance_m, vector_to_gps
-from protocols.namespace_loader import load_protocol_namespace
-
-UAV = load_protocol_namespace("uav")
+from lib.occid_bus import occid
+from lib.occid_topics import ANGULAR_VELOCITY, ATTITUDE, FLIGHT_CONTROL, LOCATION
+from lib.uav_client import UavClient, UavCommandError
 
 
 class MissionAbort(RuntimeError):
@@ -35,276 +27,255 @@ class TakeoffLandCore(CoreBase):
         mission_cfg = cfg["mission"]
         apply_cfg(self, mission_cfg)
         self.poll_interval_s = float(mission_cfg["poll_interval_s"])
-        interface_cfg = cfg["interface"]
-        self.interface_id = interface_cfg["id"]
-        self.interface_ns = interface_cfg["topic_ns"]
 
-        base = build_topic_base(self.interface_id, self.interface_ns)
-        self.request_topic = build_request_topic(self.interface_id, self.interface_ns)
-        self.response_topic = build_response_topic(self.interface_id, self.interface_ns)
+        self.uav = UavClient(self, cfg["interface"], float(self.response_timeout_s))
+        self.state_topics = self.uav.state_topics(self.state_keys)
+        self.init_bus(self.poll_interval_s, self.state_topics, self.uav.response_topic)
 
-        self.state_topics = build_state_topics(
-            base,
-            self.state_keys,
+    def _flight_control(self) -> Any | None:
+        return self.uav.flight_control()
+
+    def _location(self) -> Any | None:
+        return self.uav.location()
+
+    def _attitude(self) -> Any | None:
+        return self.uav.attitude()
+
+    def _angular_velocity(self) -> Any | None:
+        return self.uav.angular_velocity()
+
+    def _relative_altitude(self, location: Any | None = None) -> float | None:
+        state = self._location() if location is None else location
+        if state is None or state.altitude is None:
+            return None
+        return state.altitude.relative_m
+
+    def _gps_position(self, location: Any) -> GPSposition:
+        if location.position is None:
+            raise MissionAbort("location state has no global position")
+        relative_altitude = self._relative_altitude(location)
+        if relative_altitude is None:
+            raise MissionAbort("location state has no relative altitude")
+        return GPSposition(
+            float(location.position.lat),
+            float(location.position.lon),
+            float(relative_altitude),
         )
 
-        self.init_bus(self.poll_interval_s, self.state_topics, self.response_topic)
-        self.enable_state_logging(self.state_logging["keys"], self.state_logging["interval_s"], self.state_logging["prefix"])
+    def _validate_frame_contract(self) -> None:
+        attitude = self._attitude()
+        angular_velocity = self._angular_velocity()
+        if attitude is None or angular_velocity is None:
+            raise MissionAbort("attitude/angular-velocity state unavailable")
+        if attitude.body_frame != occid.BodyReferenceFrame.FRD:
+            raise MissionAbort(f"attitude body frame must be FRD actual={attitude.body_frame}")
+        if attitude.reference_frame != occid.InertialReferenceFrame.NED:
+            raise MissionAbort(f"attitude reference frame must be NED actual={attitude.reference_frame}")
+        if angular_velocity.frame != occid.BodyReferenceFrame.FRD:
+            raise MissionAbort(f"angular velocity frame must be FRD actual={angular_velocity.frame}")
+        print(
+            f"[CORE] {self.client_id} frames body=FRD reference=NED "
+            f"attitude_rad=({attitude.roll_rad:.4f},{attitude.pitch_rad:.4f},{attitude.yaw_rad:.4f})",
+            flush=True,
+        )
 
     def run(self) -> None:
         self.send_online()
         try:
             self.wait_until(
-                lambda: bool(self.state.get(UAV.State.Navigation.IsHomePositionOk))
-                and bool(self.state.get(UAV.State.Navigation.IsGlobalPositionOk)),
+                lambda: (
+                    self._flight_control() is not None
+                    and self._flight_control().navigation_validity is not None
+                    and bool(self._flight_control().navigation_validity.home_position_ok)
+                    and bool(self._flight_control().navigation_validity.global_position_ok)
+                    and self._location() is not None
+                    and self._attitude() is not None
+                    and self._angular_velocity() is not None
+                ),
                 float(self.state_timeout_s),
-                MissionAbort("health wait timed out"),
+                MissionAbort("initial OCCID flight state wait timed out"),
             )
+            self._validate_frame_contract()
 
+            flight = self._flight_control()
             print(
-                f"[CORE] {self.client_id} health home_ok={self.state.get(UAV.State.Navigation.IsHomePositionOk)} "
-                f"global_ok={self.state.get(UAV.State.Navigation.IsGlobalPositionOk)}",
+                f"[CORE] {self.client_id} health home_ok={flight.navigation_validity.home_position_ok} "
+                f"global_ok={flight.navigation_validity.global_position_ok} mode={flight.standard_mode} "
+                f"native_mode={flight.native_mode_name}",
                 flush=True,
             )
+            home_pos = self._gps_position(self._location())
 
-            home_state = self.wait_for_state(
-                UAV.State.Navigation.Position, float(self.state_timeout_s), MissionAbort("home position wait timed out")
-            )
-
-            home_pos = GPSposition(
-                float(home_state["LatDeg"]),
-                float(home_state["LonDeg"]),
-                float(home_state["RelAltM"]),
-            )
-
-            takeoff_alt_req = self._send_action(UAV.Action.Flight.SetTakeoffAltitude, {"AltitudeM": float(self.takeoff_altitude_m)})
-            print(
-                f"[CORE] {self.client_id} cmd SET_TAKEOFF_ALT alt_m={self.takeoff_altitude_m} req={takeoff_alt_req}",
-                flush=True,
-            )
-            resp = self._wait_response(takeoff_alt_req, float(self.response_timeout_s))
-            if not resp.get("ok"):
-                raise MissionAbort(f"set_takeoff_altitude failed resp={resp}")
+            print(f"[CORE] {self.client_id} set_takeoff_altitude alt_m={self.takeoff_altitude_m}", flush=True)
+            self.uav.set_takeoff_altitude(float(self.takeoff_altitude_m))
 
             self.wait_until(
-                lambda: self.state.get(UAV.State.Sensor.SensorConfig) is not None
-                and bool(self.state.get(UAV.State.Sensor.SensorConfig).get("ArmReady")),
-                float(self.state_timeout_s),
-                MissionAbort(
-                    f"arm readiness wait timed out sensor_config={self.state.get(UAV.State.Sensor.SensorConfig)} "
-                    f"modes={self.state.get(UAV.State.Flight.ActiveModeNames)}"
+                lambda: (
+                    self._flight_control() is not None
+                    and self._flight_control().readiness is not None
+                    and bool(self._flight_control().readiness.arm_ready)
                 ),
+                float(self.state_timeout_s),
+                MissionAbort(f"arm readiness wait timed out flight_control={self._flight_control()}"),
             )
-            print(
-                f"[CORE] {self.client_id} arm_ready sensor_config={self.state.get(UAV.State.Sensor.SensorConfig)} "
-                f"modes={self.state.get(UAV.State.Flight.ActiveModeNames)}",
-                flush=True,
-            )
+            print(f"[CORE] {self.client_id} arm_ready readiness={self._flight_control().readiness}", flush=True)
 
-            arm_req = self._send_action(UAV.Action.Flight.Arm, {})
-            print(f"[CORE] {self.client_id} cmd ARM req={arm_req}", flush=True)
-            resp = self._wait_response(arm_req, float(self.response_timeout_s))
-            if not resp.get("ok"):
-                raise MissionAbort(f"arm failed resp={resp}")
-
-            self.wait_for_state(
-                UAV.State.Flight.IsArmed,
+            print(f"[CORE] {self.client_id} arm", flush=True)
+            self.uav.arm()
+            self.wait_until(
+                lambda: self._flight_control() is not None and bool(self._flight_control().armed),
                 float(self.state_timeout_s),
                 MissionAbort("armed wait timed out"),
-                lambda value: bool(value),
             )
-            print(f"[CORE] {self.client_id} armed", flush=True)
 
             self.wait_until(
-                lambda: bool(self.state.get(UAV.State.Flight.IsArmed))
-                and self.state.get(UAV.State.Sensor.SensorConfig) is not None
-                and bool(self.state.get(UAV.State.Sensor.SensorConfig).get("TakeoffReady")),
-                float(self.state_timeout_s),
-                MissionAbort(
-                    f"takeoff readiness wait timed out sensor_config={self.state.get(UAV.State.Sensor.SensorConfig)} "
-                    f"modes={self.state.get(UAV.State.Flight.ActiveModeNames)}"
+                lambda: (
+                    self._flight_control() is not None
+                    and bool(self._flight_control().armed)
+                    and self._flight_control().readiness is not None
+                    and bool(self._flight_control().readiness.takeoff_ready)
                 ),
+                float(self.state_timeout_s),
+                MissionAbort(f"takeoff readiness wait timed out flight_control={self._flight_control()}"),
             )
-            print(
-                f"[CORE] {self.client_id} takeoff_ready sensor_config={self.state.get(UAV.State.Sensor.SensorConfig)} "
-                f"modes={self.state.get(UAV.State.Flight.ActiveModeNames)}",
-                flush=True,
-            )
+            print(f"[CORE] {self.client_id} takeoff_ready readiness={self._flight_control().readiness}", flush=True)
 
-            takeoff_req = self._send_action(UAV.Action.Flight.Takeoff, {})
-            print(f"[CORE] {self.client_id} cmd TAKEOFF req={takeoff_req}", flush=True)
-            resp = self._wait_response(takeoff_req, float(self.response_timeout_s))
-            if not resp.get("ok"):
-                raise MissionAbort(f"takeoff failed resp={resp}")
-
+            print(f"[CORE] {self.client_id} takeoff", flush=True)
+            self.uav.takeoff()
             self.wait_until(
-                lambda: bool(self.state.get(UAV.State.Flight.IsInAir))
-                and self.state.get(UAV.State.Navigation.AltitudeM) is not None
-                and self.state.get(UAV.State.Navigation.AltitudeM) >= float(self.takeoff_altitude_m) * float(self.takeoff_altitude_ok_fraction),
+                lambda: (
+                    self._flight_control() is not None
+                    and bool(self._flight_control().in_air)
+                    and self._relative_altitude() is not None
+                    and float(self._relative_altitude())
+                    >= float(self.takeoff_altitude_m) * float(self.takeoff_altitude_ok_fraction)
+                ),
                 float(self.state_timeout_s),
                 MissionAbort("in-air wait timed out"),
             )
-            print(f"[CORE] {self.client_id} in_air alt_m={self.state.get(UAV.State.Navigation.AltitudeM)}", flush=True)
-
-            print(
-                f"[CORE] {self.client_id} hold wait_s={self.post_takeoff_wait_s} alt_target_m={self.takeoff_altitude_m}",
-                flush=True,
-            )
+            print(f"[CORE] {self.client_id} in_air alt_m={self._relative_altitude()}", flush=True)
             self.pump_for(float(self.post_takeoff_wait_s))
 
-            goto_start_state = self.wait_for_state(
-                UAV.State.Navigation.Position, float(self.state_timeout_s), MissionAbort("go-to start position wait timed out")
-            )
-
-            goto_start = GPSposition(
-                float(goto_start_state["LatDeg"]),
-                float(goto_start_state["LonDeg"]),
-                float(goto_start_state["RelAltM"]),
-            )
+            goto_start = self._gps_position(self._location())
             goto_target = vector_to_gps(goto_start, dist=float(self.go_north_distance_m), az=0.0)
-            go_to_req = self._send_action(
-                UAV.Action.Navigation.GoTo,
-                {
-                    "Latitude": float(goto_target.lat),
-                    "Longitude": float(goto_target.lon),
-                    "AltitudeM": float(self.takeoff_altitude_m),
-                    "YawDeg": float(self.goto_yaw_deg),
-                },
-            )
             print(
-                f"[CORE] {self.client_id} cmd GO_TO_NORTH req={go_to_req} "
-                f"north_m={self.go_north_distance_m} lat={goto_target.lat} lon={goto_target.lon}",
+                f"[CORE] {self.client_id} go_to north_m={self.go_north_distance_m} "
+                f"lat={goto_target.lat} lon={goto_target.lon} alt_m={self.takeoff_altitude_m}",
                 flush=True,
             )
-            resp = self._wait_response(go_to_req, float(self.response_timeout_s))
-            if not resp.get("ok"):
-                raise MissionAbort(f"go_to failed resp={resp}")
+            self.uav.go_to(
+                float(goto_target.lat),
+                float(goto_target.lon),
+                float(self.takeoff_altitude_m),
+                altitude_datum=occid.AltitudeDatum.RELATIVE,
+                yaw_rad=math.radians(float(self.goto_yaw_deg)),
+            )
 
             target_distance_m = None
-            goto_deadline = time.monotonic() + float(self.goto_timeout_s)
+            deadline = time.monotonic() + float(self.goto_timeout_s)
             while True:
-                position_state = self.state.get(UAV.State.Navigation.Position)
-                if position_state is not None:
-                    current_pos = GPSposition(
-                        float(position_state["LatDeg"]),
-                        float(position_state["LonDeg"]),
-                        float(position_state["RelAltM"]),
-                    )
-                    target_distance_m = gps_distance_m(current_pos, goto_target)
+                location = self._location()
+                if location is not None:
+                    target_distance_m = gps_distance_m(self._gps_position(location), goto_target)
                     if target_distance_m <= float(self.goto_arrival_radius_m):
                         break
-                if time.monotonic() > goto_deadline:
+                if time.monotonic() > deadline:
                     raise MissionAbort("go-to arrival wait timed out")
-                self._pump_once(goto_deadline)
+                self._pump_once(deadline)
             print(
-                f"[CORE] {self.client_id} arrived target_dist_m={target_distance_m} "
-                f"threshold_m={self.goto_arrival_radius_m}",
+                f"[CORE] {self.client_id} arrived target_dist_m={target_distance_m} threshold_m={self.goto_arrival_radius_m}",
                 flush=True,
             )
 
-            alt_req = self._send_action(
-                UAV.Action.Navigation.GoTo,
-                {
-                    "Latitude": float(goto_target.lat),
-                    "Longitude": float(goto_target.lon),
-                    "AltitudeM": float(self.target_altitude_m),
-                    "YawDeg": float(self.goto_yaw_deg),
-                },
+            print(f"[CORE] {self.client_id} go_to altitude_m={self.target_altitude_m}", flush=True)
+            self.uav.go_to(
+                float(goto_target.lat),
+                float(goto_target.lon),
+                float(self.target_altitude_m),
+                altitude_datum=occid.AltitudeDatum.RELATIVE,
+                yaw_rad=math.radians(float(self.goto_yaw_deg)),
             )
-            print(
-                f"[CORE] {self.client_id} cmd GO_TO_ALT req={alt_req} alt_m={self.target_altitude_m}",
-                flush=True,
-            )
-            resp = self._wait_response(alt_req, float(self.response_timeout_s))
-            if not resp.get("ok"):
-                raise MissionAbort(f"go_to altitude failed resp={resp}")
-
             self.wait_until(
-                lambda: self.state.get(UAV.State.Navigation.AltitudeM) is not None
-                and abs(float(self.state.get(UAV.State.Navigation.AltitudeM)) - float(self.target_altitude_m))
-                <= float(self.altitude_tolerance_m),
+                lambda: (
+                    self._relative_altitude() is not None
+                    and abs(float(self._relative_altitude()) - float(self.target_altitude_m))
+                    <= float(self.altitude_tolerance_m)
+                ),
                 float(self.altitude_change_timeout_s),
                 MissionAbort("altitude change wait timed out"),
             )
             print(
-                f"[CORE] {self.client_id} altitude reached alt_m={self.state.get(UAV.State.Navigation.AltitudeM)} "
+                f"[CORE] {self.client_id} altitude reached alt_m={self._relative_altitude()} "
                 f"target_m={self.target_altitude_m} tol_m={self.altitude_tolerance_m}",
                 flush=True,
             )
 
-            rtl_req = self._send_action(UAV.Action.Flight.Rtl, {})
-            print(f"[CORE] {self.client_id} cmd RTL req={rtl_req}", flush=True)
-            resp = self._wait_response(rtl_req, float(self.response_timeout_s))
-            if not resp.get("ok"):
-                raise MissionAbort(f"rtl failed resp={resp}")
-
+            print(f"[CORE] {self.client_id} return_to_launch", flush=True)
+            self.uav.return_to_launch()
             home_distance_m = None
-            rtl_deadline = time.monotonic() + float(self.rtl_timeout_s)
+            deadline = time.monotonic() + float(self.rtl_timeout_s)
             while True:
-                position_state = self.state.get(UAV.State.Navigation.Position)
-                if position_state is not None:
-                    current_pos = GPSposition(
-                        float(position_state["LatDeg"]),
-                        float(position_state["LonDeg"]),
-                        float(position_state["RelAltM"]),
-                    )
-                    home_distance_m = gps_distance_m(current_pos, home_pos)
+                location = self._location()
+                if location is not None:
+                    home_distance_m = gps_distance_m(self._gps_position(location), home_pos)
                     if home_distance_m <= float(self.home_arrival_radius_m):
                         break
-                if time.monotonic() > rtl_deadline:
+                if time.monotonic() > deadline:
                     raise MissionAbort("rtl home wait timed out")
-                self._pump_once(rtl_deadline)
+                self._pump_once(deadline)
             print(
-                f"[CORE] {self.client_id} home reached dist_m={home_distance_m} "
-                f"threshold_m={self.home_arrival_radius_m}",
+                f"[CORE] {self.client_id} home reached dist_m={home_distance_m} threshold_m={self.home_arrival_radius_m}",
                 flush=True,
             )
 
-            land_req = self._send_action(UAV.Action.Flight.Land, {})
-            print(f"[CORE] {self.client_id} cmd LAND req={land_req}", flush=True)
-            resp = self._wait_response(land_req, float(self.response_timeout_s))
-            if not resp.get("ok"):
-                raise MissionAbort(f"land failed resp={resp}")
-
+            print(f"[CORE] {self.client_id} land", flush=True)
+            self.uav.land()
             self.wait_until(
-                lambda: not bool(self.state.get(UAV.State.Flight.IsInAir))
-                and self.state.get(UAV.State.Navigation.AltitudeM) is not None
-                and self.state.get(UAV.State.Navigation.AltitudeM) <= float(self.land_altitude_threshold_m),
+                lambda: (
+                    self._flight_control() is not None
+                    and not bool(self._flight_control().in_air)
+                    and self._relative_altitude() is not None
+                    and float(self._relative_altitude()) <= float(self.land_altitude_threshold_m)
+                ),
                 float(self.land_timeout_s),
                 MissionAbort("landed wait timed out"),
             )
-
             print(
-                f"[CORE] {self.client_id} landed in_air={self.state.get(UAV.State.Flight.IsInAir)} "
-                f"alt_m={self.state.get(UAV.State.Navigation.AltitudeM)}",
+                f"[CORE] {self.client_id} landed in_air={self._flight_control().in_air} alt_m={self._relative_altitude()}",
                 flush=True,
             )
-
             self.publish_shutdown()
 
-        except MissionAbort as exc:
-            if bool(self.state.get(UAV.State.Flight.IsInAir)):  # Airborne abort handling is not implemented yet.
-                pass
+        except (MissionAbort, UavCommandError) as exc:
+            flight = self._flight_control()
+            if flight is not None and bool(flight.in_air):
+                pass  # Airborne abort/recovery policy remains separate work.
             abort_topic = f"DIAG/{self.client_id}/ABORT"
-            abort_data = {"event": "ABORT", "reason": str(exc)}
-            self.client.publish(abort_topic, build_envelope(self.client_id, abort_topic, abort_data))
+            self.client.publish(
+                abort_topic,
+                build_envelope(self.client_id, abort_topic, {"event": "ABORT", "reason": str(exc)}),
+            )
             print(f"[CORE] {self.client_id} mission_abort reason={exc}", flush=True)
             self.publish_shutdown()
-
         except RuntimeError:
             error_topic = f"DIAG/{self.client_id}/ERROR"
-            error_payload = build_envelope(
-                self.client_id,
+            self.client.publish(
                 error_topic,
-                {"event": "ERROR", "traceback": traceback.format_exc().strip()},
+                build_envelope(
+                    self.client_id,
+                    error_topic,
+                    {"event": "ERROR", "traceback": traceback.format_exc().strip()},
+                ),
             )
-            self.client.publish(error_topic, error_payload)
             raise
         except KeyboardInterrupt:
             abort_topic = f"DIAG/{self.client_id}/ABORT"
-            abort_data = {"event": "ABORT", "reason": "KeyboardInterrupt"}
-            self.client.publish(abort_topic, build_envelope(self.client_id, abort_topic, abort_data))
-            print(f"[CORE] {self.client_id} keyboard_interrupt in_air={self.state.get(UAV.State.Flight.IsInAir)}", flush=True)
+            flight = self._flight_control()
+            self.client.publish(
+                abort_topic,
+                build_envelope(self.client_id, abort_topic, {"event": "ABORT", "reason": "KeyboardInterrupt"}),
+            )
+            print(f"[CORE] {self.client_id} keyboard_interrupt in_air={None if flight is None else flight.in_air}", flush=True)
             raise
         finally:
             self.stop()

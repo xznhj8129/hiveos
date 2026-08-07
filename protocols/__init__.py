@@ -1,1 +1,0 @@
-from .namespace_loader import load_protocol_namespace

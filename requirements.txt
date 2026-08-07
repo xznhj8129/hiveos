@@ -7,3 +7,5 @@ numpy
 filterpy
 simple-pid
 PyYAML
+pydantic>=2
+msgpack

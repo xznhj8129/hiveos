@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
-"""
-Usage:
-    from flight_cores.atak_example.atak_example import run_core
-    run_core(cfg, bus_config)
-"""
+"""Program example that monitors CoT-derived OCCID entity state."""
+
+from __future__ import annotations
 
 from typing import Any, Dict
 
 from lib.common import build_state_topics, build_topic_base
 from lib.core_base import CoreBase
-from protocols.namespace_loader import load_protocol_namespace
-
-ATAK = load_protocol_namespace("atak")
+from lib.occid_bus import get_occid_state, occid
+from lib.occid_topics import ENTITY_STATE
 
 
 class AtakExampleCore(CoreBase):
@@ -19,24 +16,20 @@ class AtakExampleCore(CoreBase):
         super().__init__(cfg, bus_config)
         self.poll_interval_s = float(cfg["poll_interval_s"])
         interface_cfg = cfg["interface"]
-        interface_id = interface_cfg["id"]
-        interface_ns = interface_cfg["topic_ns"]
-        base = build_topic_base(interface_id, interface_ns)
-        state_topics = build_state_topics(base, [ATAK.State.Rx.LastEvent])
+        base = build_topic_base(interface_cfg["id"], interface_cfg["topic_ns"])
+        state_topics = build_state_topics(base, [ENTITY_STATE])
         self.init_bus(self.poll_interval_s, state_topics)
-        self.last_event_topic = state_topics[ATAK.State.Rx.LastEvent]
+        self.entity_state_topic = state_topics[ENTITY_STATE]
 
     def run(self) -> None:
         self.send_online()
         try:
             while True:
                 topic, _payload = self._pump_once()
-                if topic == self.last_event_topic:
-                    event = self.state.get(ATAK.State.Rx.LastEvent)
-                    print(
-                        f"[CORE] {self.client_id} last_event={event}",
-                        flush=True,
-                    )
+                if topic != self.entity_state_topic:
+                    continue
+                state = get_occid_state(self.state, ENTITY_STATE, occid.EntityState)
+                print(f"[CORE] {self.client_id} entity_state={state}", flush=True)
         except KeyboardInterrupt:
             pass
         finally:

@@ -1,0 +1,62 @@
+name: OCCID cutover checks
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  static-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out MPFC
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check out OCCID SDK
+        uses: actions/checkout@v4
+        with:
+          repository: xznhj8129/occid
+          path: occid-sdk
+
+      - name: Install OCCID test dependencies
+        run: python -m pip install 'pydantic>=2' msgpack PyYAML
+
+      - name: Compile MPFC Python sources
+        run: python -m compileall -q main.py lib plugins flight_cores
+
+      - name: Run OCCID interoperability contract tests
+        working-directory: occid-sdk
+        run: python -m unittest tests.test_interop_sdk
+
+      - name: Verify MPFC can load configured OCCID SDK
+        env:
+          OCCID_PATH: ${{ github.workspace }}/occid-sdk
+        run: |
+          python - <<'PY'
+          from lib.occid_bus import occid
+          from interop.common import normalized_to_pwm, pwm_to_normalized
+          from interop.mavsdk import standard_mode_from_native_name
+          from interop.msp import standard_mode_from_native_names
+
+          assert occid.OCCID_SCHEMA_VERSION == (3, 0, 0)
+          assert pwm_to_normalized(1000, 1000, 2000) == -1.0
+          assert pwm_to_normalized(1500, 1000, 2000) == 0.0
+          assert normalized_to_pwm(1.0, 1000, 2000) == 2000
+          assert standard_mode_from_native_name('OFFBOARD') == occid.StandardFlightMode.EXTERNAL_CONTROL
+          assert standard_mode_from_native_names(['NAV_RTH']) == occid.StandardFlightMode.SAFE_RECOVERY
+          PY
+
+      - name: Reject legacy semantic namespace imports
+        run: |
+          if grep -R -n --include='*.py' 'protocols\.namespace_loader\|load_protocol_namespace' main.py lib plugins flight_cores; then
+            echo 'legacy protocol namespace dependency remains'
+            exit 1
+          fi
+          test ! -e protocols/uav.yaml
+          test ! -e protocols/atak.yaml
+          test ! -e protocols/hello.yaml
+          test ! -e protocols/namespace_loader.py
