@@ -1,3 +1,4 @@
-* Establish reference conventions
-* Pi interface module for GPIO, Wifi, BT, etc
-* mismatch between config state keys and protocol keys
+* Complete Program naming cleanup (`flight_cores` / `CoreBase` -> Program terminology)
+* Pi interface module for GPIO, Wi-Fi, BT, etc
+* Expand OCCID adapter coverage where real Programs require additional state or commands
+* Add executable integration coverage for MAVSDK/PX4, ArduPilot, MSP/INAV, CoT, and tracker paths
