@@ -18,6 +18,7 @@ from lib.occid_bus import decode_occid_request, occid, pack_occid
 from lib.occid_topics import COT_RAW, ENTITY_STATE
 from lib.plugin_base import PluginBase
 from lib.state_scheduler import StateScheduler
+from interop.cot import CotPointFields, cot_point_to_location_state, global_position_to_cot_point, location_state_to_cot_point
 
 
 @dataclass(frozen=True)
@@ -200,23 +201,13 @@ class CotTranslator:
     def parse_event(self, xml_text: str) -> frogcot.Event:
         return frogcot.xml_to_cot(xml_text)
 
-    def marker_xml(
-        self,
-        callsign: str,
-        uid: str,
-        cottype: str,
-        lat: float,
-        lon: float,
-        alt_m: float,
-        ce_m: float | None = None,
-        le_m: float | None = None,
-    ) -> bytes:
+    def marker_xml(self, callsign: str, uid: str, cottype: str, point: CotPointFields) -> bytes:
         payload = {
-            "lat": float(lat),
-            "lon": float(lon),
-            "alt": float(alt_m),
-            "ce": self.default_ce if ce_m is None else float(ce_m),
-            "le": self.default_le if le_m is None else float(le_m),
+            "lat": float(point.lat_deg),
+            "lon": float(point.lon_deg),
+            "alt": float(point.hae_m),
+            "ce": self.default_ce if point.ce_m is None else float(point.ce_m),
+            "le": self.default_le if point.le_m is None else float(point.le_m),
         }
         return self.client.cot_marker(
             str(callsign),
@@ -226,13 +217,13 @@ class CotTranslator:
             staletime=self.stale_seconds,
         )
 
-    def geochat_xml(self, message: str, to_team: str, position: Any) -> bytes:
+    def geochat_xml(self, message: str, to_team: str, point: CotPointFields) -> bytes:
         payload = {
-            "lat": float(position.lat),
-            "lon": float(position.lon),
-            "alt": float(position.alt),
-            "ce": self.default_ce,
-            "le": self.default_le,
+            "lat": float(point.lat_deg),
+            "lon": float(point.lon_deg),
+            "alt": float(point.hae_m),
+            "ce": self.default_ce if point.ce_m is None else float(point.ce_m),
+            "le": self.default_le if point.le_m is None else float(point.le_m),
         }
         xml_bytes = self.client.geochat(str(message), to_team=str(to_team), pos=payload)
         if xml_bytes is None:
@@ -326,18 +317,14 @@ class AtakInterface(PluginBase):
     def _event_to_entity_state(self, event: Any, source: tuple[str, int]) -> Any:
         uid = str(event.unique_id)
         timestamp = event.time.timestamp() if event.time is not None else time.time()
-        ce = None if event.point.circular_error is None else float(event.point.circular_error)
-        le = None if event.point.linear_error is None else float(event.point.linear_error)
-        altitude = float(event.point.height_above_ellipsoid)
-        location = occid.LocationState(
-            position=occid.GlobalPosition(
-                lat=float(event.point.latitude),
-                lon=float(event.point.longitude),
-                alt=altitude,
-                alt_frame=occid.AltitudeDatum.SEA_LEVEL,
-            ),
-            uncertainty=occid.LocationUncertainty(horiz_err_m=ce, vert_err_m=le),
+        point = CotPointFields(
+            lat_deg=float(event.point.latitude),
+            lon_deg=float(event.point.longitude),
+            hae_m=float(event.point.height_above_ellipsoid),
+            ce_m=None if event.point.circular_error is None else float(event.point.circular_error),
+            le_m=None if event.point.linear_error is None else float(event.point.linear_error),
         )
+        location = cot_point_to_location_state(point)
         return occid.EntityState(
             record=occid.RecordMeta(
                 record_id=self._record_id(uid, timestamp),
@@ -392,37 +379,27 @@ class AtakInterface(PluginBase):
         return {"target_count": len(targets), "bytes_sent": len(xml_bytes), "tx_count": self.tx_count}
 
     def _entity_state_xml(self, state: Any) -> bytes:
-        if state.position is None or state.position.position is None:
+        if state.position is None:
             raise ValueError("EntityState requires position for CoT marker translation")
-        position = state.position.position
-        if position.alt_frame != occid.AltitudeDatum.SEA_LEVEL:
-            raise ValueError(f"CoT marker requires SEA_LEVEL altitude actual={position.alt_frame}")
-        uncertainty = state.position.uncertainty
-        ce = None if uncertainty is None else uncertainty.horiz_err_m
-        le = None if uncertainty is None else uncertainty.vert_err_m
+        point = location_state_to_cot_point(state.position)
         uid = str(state.subject_id.value)
         return self.translator.marker_xml(
             callsign=uid,
             uid=uid,
             cottype=self.translator.self_cottype,
-            lat=float(position.lat),
-            lon=float(position.lon),
-            alt_m=float(position.alt),
-            ce_m=ce,
-            le_m=le,
+            point=point,
         )
 
     def _human_text_xml(self, message: Any) -> bytes:
         if message.position is None:
             raise ValueError("HumanTextMessage requires position for ATAK geochat translation")
-        if message.position.alt_frame != occid.AltitudeDatum.SEA_LEVEL:
-            raise ValueError(f"ATAK geochat requires SEA_LEVEL altitude actual={message.position.alt_frame}")
+        point = global_position_to_cot_point(message.position)
         destination = message.destination_group
         if destination is None and message.destination_id is not None:
             destination = message.destination_id.value
         if destination is None:
             destination = message.dst.target_id.value
-        return self.translator.geochat_xml(message.message, str(destination), message.position)
+        return self.translator.geochat_xml(message.message, str(destination), point)
 
     def _handle_request(self, request: Dict[str, Any]) -> None:
         request_id, model = decode_occid_request(request)
