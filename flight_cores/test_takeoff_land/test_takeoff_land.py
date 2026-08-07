@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OCCID-native takeoff/goto/RTL/land acceptance core."""
+"""OCCID-native takeoff/goto/RTL/land acceptance program."""
 
 from __future__ import annotations
 
@@ -8,11 +8,12 @@ import time
 import traceback
 from typing import Any, Dict
 
-from lib.common import apply_cfg, build_envelope, build_request_topic, build_response_topic, build_state_topics, build_topic_base
+from lib.common import apply_cfg, build_envelope
 from lib.core_base import CoreBase
 from lib.geo_utils import GPSposition, gps_distance_m, vector_to_gps
-from lib.occid_bus import get_occid_state, occid, send_occid_command
+from lib.occid_bus import occid
 from lib.occid_topics import ANGULAR_VELOCITY, ATTITUDE, FLIGHT_CONTROL, LOCATION
+from lib.uav_client import UavClient, UavCommandError
 
 
 class MissionAbort(RuntimeError):
@@ -26,36 +27,22 @@ class TakeoffLandCore(CoreBase):
         mission_cfg = cfg["mission"]
         apply_cfg(self, mission_cfg)
         self.poll_interval_s = float(mission_cfg["poll_interval_s"])
-        interface_cfg = cfg["interface"]
-        self.interface_id = interface_cfg["id"]
-        self.interface_ns = interface_cfg["topic_ns"]
 
-        base = build_topic_base(self.interface_id, self.interface_ns)
-        self.request_topic = build_request_topic(self.interface_id, self.interface_ns)
-        self.response_topic = build_response_topic(self.interface_id, self.interface_ns)
-        self.state_topics = build_state_topics(base, self.state_keys)
-        self.init_bus(self.poll_interval_s, self.state_topics, self.response_topic)
+        self.uav = UavClient(self, cfg["interface"], float(self.response_timeout_s))
+        self.state_topics = self.uav.state_topics(self.state_keys)
+        self.init_bus(self.poll_interval_s, self.state_topics, self.uav.response_topic)
 
     def _flight_control(self) -> Any | None:
-        return get_occid_state(self.state, FLIGHT_CONTROL, occid.FlightControlState)
+        return self.uav.flight_control()
 
     def _location(self) -> Any | None:
-        return get_occid_state(self.state, LOCATION, occid.LocationState)
+        return self.uav.location()
 
     def _attitude(self) -> Any | None:
-        return get_occid_state(self.state, ATTITUDE, occid.EulerAngles)
+        return self.uav.attitude()
 
     def _angular_velocity(self) -> Any | None:
-        return get_occid_state(self.state, ANGULAR_VELOCITY, occid.AngularVelocityVector)
-
-    def _send_command(self, command: Any) -> str:
-        return send_occid_command(self.bus, self.request_topic, command)
-
-    def _require_ok(self, request_id: str, label: str) -> Dict[str, Any]:
-        response = self._wait_response(request_id, float(self.response_timeout_s))
-        if not response.get("ok"):
-            raise MissionAbort(f"{label} failed resp={response}")
-        return response
+        return self.uav.angular_velocity()
 
     def _relative_altitude(self, location: Any | None = None) -> float | None:
         state = self._location() if location is None else location
@@ -119,14 +106,8 @@ class TakeoffLandCore(CoreBase):
             )
             home_pos = self._gps_position(self._location())
 
-            request_id = self._send_command(
-                occid.SetTakeoffAltitudeCommand(relative_altitude_m=float(self.takeoff_altitude_m))
-            )
-            print(
-                f"[CORE] {self.client_id} cmd SetTakeoffAltitudeCommand alt_m={self.takeoff_altitude_m} req={request_id}",
-                flush=True,
-            )
-            self._require_ok(request_id, "set_takeoff_altitude")
+            print(f"[CORE] {self.client_id} set_takeoff_altitude alt_m={self.takeoff_altitude_m}", flush=True)
+            self.uav.set_takeoff_altitude(float(self.takeoff_altitude_m))
 
             self.wait_until(
                 lambda: (
@@ -139,16 +120,13 @@ class TakeoffLandCore(CoreBase):
             )
             print(f"[CORE] {self.client_id} arm_ready readiness={self._flight_control().readiness}", flush=True)
 
-            request_id = self._send_command(occid.ArmCommand())
-            print(f"[CORE] {self.client_id} cmd ArmCommand req={request_id}", flush=True)
-            self._require_ok(request_id, "arm")
-
+            print(f"[CORE] {self.client_id} arm", flush=True)
+            self.uav.arm()
             self.wait_until(
                 lambda: self._flight_control() is not None and bool(self._flight_control().armed),
                 float(self.state_timeout_s),
                 MissionAbort("armed wait timed out"),
             )
-            print(f"[CORE] {self.client_id} armed", flush=True)
 
             self.wait_until(
                 lambda: (
@@ -162,10 +140,8 @@ class TakeoffLandCore(CoreBase):
             )
             print(f"[CORE] {self.client_id} takeoff_ready readiness={self._flight_control().readiness}", flush=True)
 
-            request_id = self._send_command(occid.TakeoffCommand())
-            print(f"[CORE] {self.client_id} cmd TakeoffCommand req={request_id}", flush=True)
-            self._require_ok(request_id, "takeoff")
-
+            print(f"[CORE] {self.client_id} takeoff", flush=True)
+            self.uav.takeoff()
             self.wait_until(
                 lambda: (
                     self._flight_control() is not None
@@ -182,23 +158,18 @@ class TakeoffLandCore(CoreBase):
 
             goto_start = self._gps_position(self._location())
             goto_target = vector_to_gps(goto_start, dist=float(self.go_north_distance_m), az=0.0)
-            request_id = self._send_command(
-                occid.GoToCommand(
-                    position=occid.GlobalPosition(
-                        lat=float(goto_target.lat),
-                        lon=float(goto_target.lon),
-                        alt=float(self.takeoff_altitude_m),
-                        alt_frame=occid.AltitudeDatum.RELATIVE,
-                    ),
-                    yaw_rad=math.radians(float(self.goto_yaw_deg)),
-                )
-            )
             print(
-                f"[CORE] {self.client_id} cmd GoToCommand north_m={self.go_north_distance_m} "
-                f"lat={goto_target.lat} lon={goto_target.lon} req={request_id}",
+                f"[CORE] {self.client_id} go_to north_m={self.go_north_distance_m} "
+                f"lat={goto_target.lat} lon={goto_target.lon} alt_m={self.takeoff_altitude_m}",
                 flush=True,
             )
-            self._require_ok(request_id, "go_to")
+            self.uav.go_to(
+                float(goto_target.lat),
+                float(goto_target.lon),
+                float(self.takeoff_altitude_m),
+                altitude_datum=occid.AltitudeDatum.RELATIVE,
+                yaw_rad=math.radians(float(self.goto_yaw_deg)),
+            )
 
             target_distance_m = None
             deadline = time.monotonic() + float(self.goto_timeout_s)
@@ -216,23 +187,14 @@ class TakeoffLandCore(CoreBase):
                 flush=True,
             )
 
-            request_id = self._send_command(
-                occid.GoToCommand(
-                    position=occid.GlobalPosition(
-                        lat=float(goto_target.lat),
-                        lon=float(goto_target.lon),
-                        alt=float(self.target_altitude_m),
-                        alt_frame=occid.AltitudeDatum.RELATIVE,
-                    ),
-                    yaw_rad=math.radians(float(self.goto_yaw_deg)),
-                )
+            print(f"[CORE] {self.client_id} go_to altitude_m={self.target_altitude_m}", flush=True)
+            self.uav.go_to(
+                float(goto_target.lat),
+                float(goto_target.lon),
+                float(self.target_altitude_m),
+                altitude_datum=occid.AltitudeDatum.RELATIVE,
+                yaw_rad=math.radians(float(self.goto_yaw_deg)),
             )
-            print(
-                f"[CORE] {self.client_id} cmd GoToCommand alt_m={self.target_altitude_m} req={request_id}",
-                flush=True,
-            )
-            self._require_ok(request_id, "go_to_altitude")
-
             self.wait_until(
                 lambda: (
                     self._relative_altitude() is not None
@@ -248,10 +210,8 @@ class TakeoffLandCore(CoreBase):
                 flush=True,
             )
 
-            request_id = self._send_command(occid.ReturnToLaunchCommand())
-            print(f"[CORE] {self.client_id} cmd ReturnToLaunchCommand req={request_id}", flush=True)
-            self._require_ok(request_id, "rtl")
-
+            print(f"[CORE] {self.client_id} return_to_launch", flush=True)
+            self.uav.return_to_launch()
             home_distance_m = None
             deadline = time.monotonic() + float(self.rtl_timeout_s)
             while True:
@@ -268,10 +228,8 @@ class TakeoffLandCore(CoreBase):
                 flush=True,
             )
 
-            request_id = self._send_command(occid.LandCommand())
-            print(f"[CORE] {self.client_id} cmd LandCommand req={request_id}", flush=True)
-            self._require_ok(request_id, "land")
-
+            print(f"[CORE] {self.client_id} land", flush=True)
+            self.uav.land()
             self.wait_until(
                 lambda: (
                     self._flight_control() is not None
@@ -288,7 +246,7 @@ class TakeoffLandCore(CoreBase):
             )
             self.publish_shutdown()
 
-        except MissionAbort as exc:
+        except (MissionAbort, UavCommandError) as exc:
             flight = self._flight_control()
             if flight is not None and bool(flight.in_air):
                 pass  # Airborne abort/recovery policy remains separate work.
