@@ -4,6 +4,9 @@ Signed normalized-control/PWM conversion is canonical in OCCID SDK interop.
 These wrappers preserve the existing MPFC helper names for current callers.
 """
 
+# Importing occid_bus resolves OCCID_PATH / the sibling OCCID checkout before
+# importing SDK interop modules, so these helpers also work outside main.py.
+from lib.occid_bus import occid as _occid  # noqa: F401
 from interop.common import normalized_to_pwm, pwm_to_normalized
 
 
