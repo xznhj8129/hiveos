@@ -103,15 +103,37 @@ def get_occid_state(state: dict[str, Any], key: str, expected_type: type | tuple
     return model
 
 
+def _next_request_id(router: Any) -> str:
+    router.request_counter += 1
+    return f"req-{router.request_counter}"
+
+
+def send_occid_request(router: Any, request_topic: str, model: Any) -> str:
+    """Send any OCCID model to a plugin request endpoint.
+
+    This is local IPC request/response correlation only; the model itself remains
+    the complete semantic payload.
+    """
+    if not is_occid_model(model):
+        raise TypeError(f"expected OCCID model, got {type(model).__name__}")
+    request_id = _next_request_id(router)
+    payload = {"request_id": request_id, "model": pack_occid(model)}
+    from lib.common import build_envelope
+
+    router.publish(request_topic, build_envelope(router.client_id, request_topic, payload))
+    return request_id
+
+
+def decode_occid_request(request: dict[str, Any]) -> tuple[str, Any]:
+    request_id = str(request["request_id"])
+    return request_id, unpack_occid(request["model"])
+
+
 def send_occid_command(router: Any, request_topic: str, command: Any) -> str:
     if not isinstance(command, occid.Command):
         raise TypeError(f"expected OCCID Command, got {type(command).__name__}")
-    router.request_counter += 1
-    request_id = f"req-{router.request_counter}"
-    payload = {
-        "request_id": request_id,
-        "command": pack_occid(command),
-    }
+    request_id = _next_request_id(router)
+    payload = {"request_id": request_id, "command": pack_occid(command)}
     from lib.common import build_envelope
 
     router.publish(request_topic, build_envelope(router.client_id, request_topic, payload))
