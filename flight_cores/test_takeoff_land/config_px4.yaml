@@ -1,9 +1,9 @@
 my_name: uav1
 
 vehicle:
-  autopilot: FCAutopilotType.PX4
-  uav_type: UAVType.Copter
-  telem_type: TelemType.Mavlink2
+  autopilot: AutopilotType.PX4
+  airframe: AirframeType.COPTER
+  telem_type: TelemetryType.MAVLINK
 
 core:
   name: test_takeoff_land
