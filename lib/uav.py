@@ -1,18 +1,18 @@
-"""Shared UAV helpers."""
+"""Shared UAV compatibility helpers.
+
+Signed normalized-control/PWM conversion is canonical in OCCID SDK interop.
+These wrappers preserve the existing MPFC helper names for current callers.
+"""
+
+from interop.common import normalized_to_pwm, pwm_to_normalized
 
 
 def scale_float_pwm(value: float, pwm_low: int, pwm_high: int) -> int:
-    if value < -1.0 or value > 1.0:
-        raise ValueError("value must be between -1.0 and 1.0")
-    scaled_value = pwm_low + ((value + 1.0) / 2.0) * (pwm_high - pwm_low)
-    return int(scaled_value)
+    return normalized_to_pwm(value, pwm_low, pwm_high)
 
 
 def scale_pwm_float(value: float, pwm_low: int, pwm_high: int) -> float:
-    if value < pwm_low or value > pwm_high:
-        raise ValueError("value must be within PWM bounds")
-    normalized = 2.0 * ((value - pwm_low) / (pwm_high - pwm_low)) - 1.0
-    return round(normalized, 3)
+    return pwm_to_normalized(value, pwm_low, pwm_high)
 
 
 def scale_aux_pwm_float(value: float, pwm_mid: int, pwm_low: int, pwm_high: int) -> int:
