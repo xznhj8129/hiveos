@@ -203,8 +203,9 @@ def configure_runtime_plugins(config: Dict[str, Any], vehicle: Dict[str, str] | 
     if vehicle is not None:
         core_cfg["vehicle"] = dict(vehicle)
 
-    # Controller plugins remain supported for legacy/non-flight configurations,
-    # but OCCID-native flight cores should bind directly to their endpoint adapter.
+    # When a UAV controller is present it is the stable program-facing UAV API.
+    # The supervisor selects exactly one compatible endpoint adapter and injects
+    # that backend into the controller; programs never bind to MAVSDK/MSP directly.
     controller_plugins = [entry for entry in plugins_raw if entry.get("cfg", {}).get("is_controller")]
     if len(controller_plugins) > 1:
         raise RuntimeError(f"multiple controller plugins configured count={len(controller_plugins)}")
