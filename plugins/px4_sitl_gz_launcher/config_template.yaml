@@ -8,7 +8,7 @@ cfg:
   poll_interval_s: 0.5
   # required PX4 settings
   px4:
-    px4_dir: ../../../other_software/PX4-Autopilot
+    px4_dir: ../../px4dev/PX4-Autopilot
     sitl_vehicle: gz_x500_mono_cam
     airframe_vehicle: gz_x500_mono_cam
     companion_mavlink_port: 14540
