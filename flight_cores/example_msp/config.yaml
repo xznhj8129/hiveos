@@ -1,8 +1,8 @@
 my_name: uav1
 vehicle:
-  autopilot: FCAutopilotType.INAV
-  uav_type: UAVType.Copter
-  telem_type: TelemType.MSPV2
+  autopilot: AutopilotType.INAV
+  airframe: AirframeType.COPTER
+  telem_type: TelemetryType.MSP
 core:
   name: example_msp
   cfg:
@@ -10,7 +10,8 @@ core:
     poll_interval_s: 0.1
     print_interval_s: 1.0
     state_timeout_s: 20.0
-      
+    response_timeout_s: 20.0
+
 bus_config:
   schema_path: ../../config/bus_topics_schema.json
   log_file: hivebus.log
@@ -25,10 +26,6 @@ plugins:
     topic_ns: UAV
     poll_interval_s: 0.1
     response_timeout_s: 20.0
-    ardupilot:
-      armable_timeout_s: 60.0
-      takeoff_readiness_timeout_s: 60.0
-      post_arm_takeoff_wait_s: 5.0
 - plugin: msp_interface
   cfg:
     id: mspapi
@@ -42,37 +39,14 @@ plugins:
     conn_max_retries: 1
     conn_reconnect_delay_s: 0.5
     state_intervals:
-      IsInAir: 0.5
-      IsArmed: 0.5
-      IsHomePositionOk: 0.5
-      IsGlobalPositionOk: 0.5
-      AltitudeM: 0.5
-      Position: 0.5
-      FixType: 0.5
-      NumSat: 0.5
-      NavState: 0.5
-      GpsInfo: 0.5
-      RawGps: 0.5
-      AttitudeRad: 0.2
-      AngVelRadS: 0.2
-      Imu: 0.2
-      RcTelemetry: 0.2
-      ControlOverride: 0.2
-      ControlOutput: 0.2
-      RxConfig: 1.0
-      ChannelMap: 1.0
-      ModeRanges: 1.0
-      ActiveModes: 0.5
-      ActiveModeNames: 0.5
-      OverrideActive: 0.2
-      Failsafe: 0.2
-      Battery: 0.5
-      Analog: 0.5
-      SensorConfig: 1.0
-      FcConnected: 1.0
-      CpuLoad: 0.5
-      CycleTime: 0.5
-      FcInfo: 1.0
-      WaypointInfo: 1.0
-      GpsStatistics: 1.0
-      FlightMode: 0.2
+      flight_control: 0.2
+      location: 0.2
+      attitude: 0.1
+      angular_velocity: 0.1
+      gnss: 0.5
+      power: 0.5
+      imu: 0.2
+      rc_telemetry: 0.2
+      control_override: 0.2
+      control_output: 0.2
+      runtime_load: 0.5
