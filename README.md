@@ -2,254 +2,148 @@
 ## Multi-Protocol Flight Computer
 *Monty Python's Flying Clankers*
 
-## WIP
-This is pre-0.01 initial development and sketching out, a lot will change quickly. A lot of the current architecture, message formats, schema types, networking and else may change dramatically.
+MPFC is a lightweight, bus-first runtime for autonomous and remotely controlled robotic systems. A user-written **Program** expresses the purpose of the system. Reusable **plugins** provide capabilities such as UAV control, MAVLink, MSP, CoT/ATAK, tracking, vision, and datalinks.
 
-**Bus-first modular flight runtime for UAV systems.**
+MPFC deliberately keeps the runtime simple: normal Python processes, MQTT IPC, explicit plugins, and readable Programs. OCCID is the common semantic model inside the runtime.
 
-MPFC decouples mission logic from protocol complexity. Flight cores express linear, readable mission intent while plugins handle the messy details of MAVLink, MSP, YOLO, CoT, and other integrations — all communicating over a structured MQTT message bus.
-
-**Why not ROS**\
-MPFC is simple on purpose: one mission core, plugins for protocol stuff, an MQTT bus, and messages you can read directly. No special build maze, no huge framework stack, no graph debugging rabbit hole. This is intended to just work.
-
----
-
-## Table of Contents
-
-- [Key Concepts](#key-concepts)
-- [Architecture](#architecture)
-- [Quick Start](#quick-start)
-- [Configuration](#configuration)
-- [Flight Cores](#flight-cores)
-- [Plugins](#plugins)
-- [Bus Contract](#bus-contract)
-- [Protocol System](#protocol-system)
-- [Lifecycle and Supervision](#lifecycle-and-supervision)
-- [Shared Runtime API](#shared-runtime-api)
-- [Development Guide](#development-guide)
-- [Dependencies](#dependencies)
-
----
-
-## Key Concepts
-
-| Concept | Role |
-|---------|------|
-| **Flight Core** | Mission sequencing and decision logic. Linear, readable, policy-driven. One per runtime. |
-| **Plugin** | Protocol/device translation. Reusable, stateless from the core's perspective. N per runtime. |
-| **Bus** | MQTT message bus with structured topics. All processes are peers — no direct calls between them. |
-| **Protocol Namespace** | Typed vocabulary (`UAV.Action.Arm`, `UAV.State.Position`, ...) loaded from JSON schemas. |
-| **Supervisor** | `main.py` spawns and monitors all processes, triggers graceful shutdown on failures. |
-
----
+> The current code still uses the historical names `flight_cores/`, `CoreBase`, and `run_core()`. Conceptually these are Programs. Renaming the code surface is a separate cleanup after the OCCID migration is stable.
 
 ## Architecture
 
-```
-┌────────────────────────────────────────────────────────────┐
-│  main.py (supervisor)                                      │
-│  ┌─────────────┐  ┌────────────────┐  ┌────────────────┐   │
-│  │ Flight Core │  │ uav_controller │  │ Interface      │   │
-│  │ (mission)   │  │ (flight policy)│  │ plugin/backend │   │
-│  └──────┬──────┘  └────────┬───────┘  └──────┬─────────┘   │
-│         │                  │                 │             │
-│  ───────┴──────────────────┴─────────────────┴────────     │
-│              MQTT Bus  (mpfc/<instance>/...)             │
-└────────────────────────────────────────────────────────────┘
-```
+```text
+                         MPFC runtime
 
-**Runtime flow:**
-
-1. Load YAML config from `MAIN_CONFIG` env var
-2. Apply CLI overrides (`--key=value`) and merge plugin config templates
-3. Resolve `<placeholder>` tokens and top-level `vehicle` enum values
-4. Select the active flight backend from `vehicle.autopilot` + `vehicle.telem_type`
-5. Bind the core to `uav_controller` and inject the selected backend into it
-6. Spawn one core process + N plugin processes
-7. Supervise via `DIAG/#` diagnostics — shutdown on crash or error
-
----
-
-## Conventions
-**Right-Hand**
-**Axis Positive:**
-**Local 2D: RD**
-**Local 3D: FRD**
-**World 3D: NED**
-**Angles: YPR (Radians)**
-**Control: AETR**
-**Altitudes are always positive up**
-
----
-
-## Quick Start
-
-**Prerequisites:** Python 3.10+, an MQTT broker (e.g. Mosquitto) running on `localhost:1883`.
-
-```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Run the basic hello-world core
-MAIN_CONFIG=flight_cores/test_core/config.yaml python main.py
+                         Program
+                            |
+             reusable plugin/API capabilities
+                            |
+          +-----------------+-----------------+
+          |                 |                 |
+   uav_controller       atak_interface     tracker/CV
+          |                 |                 |
+          | OCCID           | OCCID           | OCCID
+          v                 v                 v
+   +-------------+       CoT/ATAK          MCVST/etc.
+   |             |
+   v             v
+mavsdk_interface msp_interface
+   |             |
+MAVLink/MSDK     MSP
+   |             |
+PX4/ArduPilot    INAV/Betaflight
 ```
 
-### PX4 SITL (MAVLink / MAVSDK)
+The boundaries are intentional:
 
-```bash
-# Launch PX4 SITL + autonomous takeoff/land mission
-START_PX4_SITL=1 MY_NAME=uav1 MAV_PORT=14550 ./run_px4_gz_mav_example.sh
+- **Program** - the main thing being run: take off and land, turn tracker data into flight commands, patrol an area, operate a payload, etc.
+- **Plugin** - reusable functional API or external-system interface.
+- **`uav_controller`** - stable Program-facing UAV service. It applies reusable vehicle policy/readiness and speaks OCCID to Programs and endpoint adapters.
+- **Endpoint adapters** - translate OCCID directly to or from native mechanisms such as MAVSDK/MAVLink, MSP, or CoT.
+- **MQTT** - local IPC and routing only.
+- **OCCID** - semantic model. There is no separate MPFC UAV/ATAK/CV ontology.
 
-# With Gazebo world and QGroundControl output
-PX4_GZ_WORLD=baylands START_PX4_SITL=1 QGC_MAVLINK_PORT=14551 ./run_px4_gz_mav_example.sh
+A component that translates OCCID into another internal MPFC semantic vocabulary is probably in the wrong place. A component that consumes OCCID, applies real policy or behavior, and emits OCCID is fine.
+
+## Program style
+
+Programs should read like intent, not protocol plumbing. For UAV Programs the convenience API in `lib/uav_client.py` constructs and consumes OCCID models:
+
+```python
+uav.set_takeoff_altitude(10.0)
+uav.arm()
+uav.takeoff()
+uav.go_to(lat, lon, 20.0)
+uav.return_to_launch()
+uav.land()
 ```
 
-### ArduPilot SITL (MAVLink / MAVSDK)
+The same Program-facing API can be backed by PX4/MAVSDK, ArduPilot/MAVSDK, INAV/MSP, or another future adapter without introducing another semantic protocol.
 
-```bash
-START_ARDUPILOT_SITL=1 MY_NAME=uav1 MAV_PORT=14550 ./run_ardupilot_sitl_mav_example.sh
+`px4_guide` in `mpfc_additions` is the higher-rate example: tracker state and UAV state are OCCID, guidance math remains in radians, and attitude setpoints go through the UAV service. The MAVSDK adapter alone converts radians to MAVSDK's degree API.
+
+## OCCID
+
+OCCID is maintained separately in the `occid` repository. MPFC loads its generated Pydantic package either from:
+
+1. `OCCID_PATH`, pointing at the OCCID repository root, or
+2. a sibling `occid/` checkout beside the MPFC repository.
+
+Transient MQTT payloads use OCCID's own versioned MsgPack `encode()` representation, base64-wrapped only because the MQTT client currently carries JSON envelopes. MPFC does not invent another durable object representation.
+
+Representative state streams include:
+
+```text
+flight_control
+location
+attitude
+angular_velocity
+gnss
+power
+imu
+rc_telemetry
+control_override
+control_output
+runtime_load
+tracker
+entity_state
+cot_raw
 ```
 
-### Container Runtime
+These strings are routing keys, not types. The model encoded inside the payload defines the semantics.
 
-Build a multi-arch image with Docker Buildx:
+## UAV path
 
-```bash
-docker buildx build \
-  --platform linux/amd64,linux/arm64,linux/arm/v7 \
-  -t mpfc:latest .
+```text
+Program
+  |
+  | UavClient convenience API -> OCCID commands/state
+  v
+uav_controller
+  |
+  | OCCID in / OCCID out
+  v
+selected endpoint adapter
+  |
+  +-- mavsdk_interface -> MAVSDK/MAVLink -> PX4 or ArduPilot
+  +-- msp_interface    -> MSP            -> INAV/Betaflight
+  +-- liftoff_interface -> simulator telemetry
 ```
 
-For Raspberry Pi Zero 2 W and Raspberry Pi 4B, prefer a 64-bit OS and the `linux/arm64` image. Both boards are 64-bit capable. The `linux/arm/v7` build stays available for 32-bit Pi OS, but the Dockerfile intentionally skips MAVSDK and YOLO there because upstream `grpcio` / Torch support is not dependable on 32-bit ARM.
+Examples of low-level OCCID commands include `ArmCommand`, `TakeoffCommand`, `GoToCommand`, `ReturnToLaunchCommand`, `SetControlAttitudeCommand`, and `SetControlOverrideCommand`. These are immediate control imperatives, not Task/Assignment/Execution lifecycle objects.
 
-Run the container with host networking so MQTT, MAVLink UDP, ATAK multicast, and HiveLink UDP behave like a native Linux service:
+## Reference-frame contract
 
-```bash
-docker run --rm -it \
-  --network host \
-  -v /dev/bus/usb:/dev/bus/usb \
-  --device /dev/ttyUSB0 \
-  --device /dev/ttyACM0 \
-  --device /dev/serial0 \
-  --device /dev/gpiomem \
-  --device /dev/gpiochip0 \
-  --device /dev/gpiochip1 \
-  -e MAIN_CONFIG=/opt/mpfc/flight_cores/test_core/config.yaml \
-  -v "$PWD:/opt/mpfc" \
-  mpfc:latest
-```
+MPFC follows these conventions unless an OCCID record explicitly states otherwise:
 
-Notes:
+- body frame: FRD
+- inertial/world frame: NED
+- angular values: radians
+- angular velocity: radians/second
+- altitude values: meters, positive upward, with explicit datum where needed
+- normalized control axes are protocol-independent; adapters own PWM/MAVSDK/native conversion
 
-- `--network host` is the recommended Linux mode for MAVLink UDP, ATAK multicast, Meshtastic sidecars, and local GCS tools.
-- Add or remove `--device` flags to match your hardware. For cameras also pass `/dev/video0` or the specific V4L device.
-- If you use `config/mavlink-router/main.conf`, point `plugins/mavsdk_interface/config_template.yaml` or your runtime config at `udp://:14540`, because the bundled router forwards the FC stream to `127.0.0.1:14540`.
-- The image starts Mosquitto, `mavlink-routerd`, and `main.py` together by default. Set `MPFC_START_MOSQUITTO=0` or `MPFC_START_MAVLINK_ROUTER=0` only when you want to use host-managed services instead.
-
-### MSP (iNav)
-
-```bash
-MAIN_CONFIG=flight_cores/example_msp/config.yaml python main.py
-```
-
-### YOLO Object Detection
-
-```bash
-# Run with default webcam (source: "0") — auto-downloads yolov8n weights
-MAIN_CONFIG=flight_cores/yolo_example/config.yaml python main.py
-
-# Run on a video file
-MAIN_CONFIG=flight_cores/yolo_example/config.yaml python main.py --source=path/to/video.mp4
-
-# Run with custom weights and GPU
-MAIN_CONFIG=flight_cores/yolo_example/config.yaml python main.py --weights=yolov8s.pt --device=0
-```
-
-### ATAK (Cursor on Target)
-
-```bash
-MAIN_CONFIG=flight_cores/atak_example/config.yaml python main.py
-```
-
----
-
-## Configuration
-
-Main config is a YAML file pointed to by the `MAIN_CONFIG` environment variable.
-
-```yaml
-my_name: uav1
-vehicle:
-  autopilot: FCAutopilotType.PX4
-  uav_type: UAVType.Copter
-  telem_type: TelemType.Mavlink2
-core:
-  name: test_takeoff_land
-  cfg:
-    id: mav_core
-    poll_interval_s: 0.5
-    takeoff_altitude_m: 10.0
-bus_config:
-  schema_path: config/bus_topics_schema.json
-  log_file: hivebus.log
-  endpoint:
-    type: mqtt
-    host: 127.0.0.1
-    port: 1883
-plugins:
-  - plugin: uav_controller
-    cfg:
-      id: uav_controller
-      topic_ns: UAV
-  - plugin: mavsdk_interface
-    cfg:
-      id: mavsdk
-      topic_ns: UAV
-      conn_str: "udp://:<mav_port>"
-```
-
-### Config Processing
-
-1. **Plugin defaults** — each plugin provides `config_template.yaml`; your `cfg` entries are overrides, not full replacements (recursive merge)
-2. **CLI overrides** — `--key=value` applies to keys in `core.cfg` and `my_name`; type-cast from existing value type; unknown keys fail immediately
-3. **Placeholder substitution** — `<token>` strings are replaced from scalar config values (e.g. `<mav_port>` from `--mav_port=14552`)
-4. **Vehicle selection** — `vehicle.autopilot` and `vehicle.telem_type` select the active flight backend; the core always talks to `uav_controller`
-
----
-
-## Flight Cores
-
-Cores live in `flight_cores/` and inherit from `CoreBase`. Each implements a `run()` method containing linear mission logic.
-
-| Core | Description |
-|------|-------------|
-| `test_core` | Hello-world example. Sends messages to plugins in a loop. |
-| `test_takeoff_land` | Full autonomous mission — takeoff, fly north, change altitude, RTL, land. Uses GPS distance calculation and attitude monitoring with failsafe handling. |
-| `example_msp` | Displays a telemetry snapshot from an iNav flight controller (23 state fields). |
-| `atak_example` | Monitors and prints incoming ATAK/CoT datalink events. |
-| `yolo_example` | Subscribes to YOLO detector plugin and prints individual detections. |
-
----
+Frame fields may be optional in OCCID when context is genuinely sufficient, but code performing transforms or control must validate the frames it depends on. `test_takeoff_land` deliberately checks this contract.
 
 ## Plugins
 
-Plugins live in `plugins/` and inherit from `PluginBase`. They translate between the standardized MPFC bus vocabulary and external protocols/devices.
+Important current plugins:
 
-| Plugin | Description |
-|--------|-------------|
-| `uav_controller` | UAV-agnostic flight layer. Accepts mission-level `UAV.Action.*`, republishes normalized `UAV.State.*`, and owns FC-specific command sequencing. |
-| `mavsdk_interface` | MAVLink/MAVSDK backend bridge for PX4 and ArduPilot. Handles transport, telemetry, and direct FC API calls. |
-| `msp_interface` | MSP backend bridge for INAV and Betaflight. Handles transport, telemetry, and direct FC API calls. |
-| `atak_interface` | ATAK/CoT tactical datalink. Dual UDP/TCP support (multicast + unicast), CoT event serialization via `frogcot`. |
-| `hivelink_interface` | Multi-transport datalink (UDP, Meshtastic/LoRa, MQTT) using the HiveLink protocol. |
-| `yolo_detector` | YOLO object detection pipeline. Runs ultralytics inference on a video source (camera, file, RTSP) and publishes each detection individually with class, confidence, and bounding box. Optional ByteTrack tracking. |
-| `example_hello` | Simple echo responder for testing the request/response message pattern. |
+| Plugin | Role |
+| --- | --- |
+| `uav_controller` | Program-facing UAV API/service and reusable flight readiness/policy |
+| `mavsdk_interface` | OCCID <-> MAVSDK/MAVLink endpoint adapter for PX4 and ArduPilot |
+| `msp_interface` | OCCID <-> MSP endpoint adapter for INAV/Betaflight |
+| `liftoff_interface` | OCCID telemetry adapter for Liftoff simulation |
+| `atak_interface` | OCCID <-> CoT/ATAK adapter over UDP/TCP |
+| `hivelink_interface` | HiveLink datalink integration; semantic OCCID transport work is separate |
+| `yolo_detector` | Vision inference plugin |
+| `example_hello` | Minimal OCCID request/response runtime smoke test |
 
----
+`atak_interface` publishes parsed CoT position updates as OCCID `EntityState` and can also expose raw CoT XML as `ProtocolPayload`. Outbound requests can translate OCCID `EntityState`, `HumanTextMessage`, or raw XML `ProtocolPayload` to CoT.
 
-## Bus Contract
+## MQTT bus
 
-All communication flows through the MQTT bus using JSON envelopes:
+Every process is an MQTT peer. The outer envelope is runtime metadata:
 
 ```json
 {
@@ -260,169 +154,127 @@ All communication flows through the MQTT bus using JSON envelopes:
 }
 ```
 
-Topics are prefixed with `mpfc/<instance_name>/` and follow these patterns:
+Topics are prefixed with `mpfc/<instance>/`.
 
-| Pattern | Direction | Purpose |
-|---------|-----------|---------|
-| `CONTROL/<command>` | Broadcast | Global commands (e.g. `CONTROL/SHUTDOWN`) |
-| `SET/<client_id>` | Any → Target | Runtime parameter mutation |
-| `<client_id>/<ns>/REQUEST` | Core → Plugin | Action request |
-| `<client_id>/<ns>/RESPONSE` | Plugin → Core | Action result |
-| `<client_id>/<ns>/STATE/<field>` | Plugin → Bus | Per-field state stream |
-| `<client_id>/<ns>/EVENT/<field>` | Plugin → Bus | Event notification |
-| `DIAG/<client_id>/<event>` | Any → Supervisor | Lifecycle diagnostics |
+Common routing patterns:
 
----
+| Pattern | Purpose |
+| --- | --- |
+| `CONTROL/<command>` | runtime lifecycle/control |
+| `SET/<client_id>` | runtime parameter mutation |
+| `<client>/<ns>/REQUEST` | correlated plugin request |
+| `<client>/<ns>/RESPONSE` | correlated plugin result |
+| `<client>/<ns>/STATE/<route>` | rate-limited OCCID state stream |
+| `DIAG/<client>/<event>` | diagnostics and lifecycle |
 
-## Protocol System
+Request IDs, response correlation, timeouts, state-rate scheduling, and MQTT envelopes are IPC mechanics. They do not form a second semantic protocol.
 
-Protocol vocabularies are defined in `protocols/*.yaml` and loaded dynamically via `namespace_loader.py`:
+## Vehicle/backend selection
 
-```python
-from protocols.namespace_loader import load_protocol_namespace
+Vehicle configuration uses OCCID enums:
 
-UAV = load_protocol_namespace("uav")
-
-# Use typed tokens instead of string literals
-self.send_action(interface_id, UAV.Action.Arm)
-altitude = self.state.get(UAV.State.AltitudeM)
+```yaml
+vehicle:
+  autopilot: AutopilotType.PX4
+  airframe: AirframeType.COPTER
+  telem_type: TelemetryType.MAVLINK
 ```
 
-### Available Protocols
+`main.py` resolves plugin templates, selects exactly one compatible endpoint adapter, injects it into `uav_controller`, and binds the Program to `uav_controller`.
 
-| Protocol | Schema | Vocabulary |
-|----------|--------|------------|
-| **UAV** | `protocols/uav.yaml` | Flight state (position, attitude, battery, GPS), actions (arm, takeoff, land, RTL, goto), sensor data |
-| **ATAK** | `protocols/atak.yaml` | CoT event state (Rx/Tx), actions (send event, send marker), system counters |
+For an INAV/MSP system:
 
-Protocol additions start in the yaml schema, then get implemented in plugins. Cores and plugins reference `UAV.Action.*`, `UAV.State.*`, etc. — never raw strings.
-
----
-
-## Lifecycle and Supervision
-
-Every process publishes lifecycle diagnostics:
-
-```
-DIAG/<id>/STARTING  →  DIAG/<id>/ONLINE  →  DIAG/<id>/STOPPED
+```yaml
+vehicle:
+  autopilot: AutopilotType.INAV
+  airframe: AirframeType.COPTER
+  telem_type: TelemetryType.MSP
 ```
 
-**Supervisor behavior** (`main.py`):
+## Examples
 
-- Monitors `DIAG/#` for all children
-- Responds to `DIAG/<id>/PING` with `DIAG/<id>/PONG` (liveness)
-- If any child exits unexpectedly or publishes `DIAG/.../ERROR` → initiates shutdown
-- Publishes `CONTROL/SHUTDOWN` → waits 5s grace period → SIGTERM remaining children
-
-**Shared base classes** (`lib/`):
-
-- `RuntimeBase` — lifecycle events, shutdown subscription, diag ping/pong
-- `CoreBase` — adds `publish_shutdown()`, clean `finish()` with exit code
-- `PluginBase` — adds response queue, error publishing, event helpers
-
----
-
-## Shared Runtime API
-
-Central primitives in `lib/common.py`:
-
-| Category | Functions |
-|----------|-----------|
-| **Config** | `load_config()`, `apply_cfg()` |
-| **Topic Builders** | `build_request_topic()`, `build_response_topic()`, `build_state_topics()`, `build_event_topics()`, `build_set_topic()` |
-| **Bus Machinery** | `BusRouter` (state/response subscription, SET dispatch), `connect_bus_client()` |
-| **Wait Primitives** | `wait_until(predicate, timeout)`, `wait_for_state(key, value, timeout)`, `pump_for(duration)` |
-| **State Scheduling** | `StateScheduler` — per-field rate-limited publishing with thread-safe flush |
-| **Geo Utilities** | GPS distance, bearing, vector math, MGRS/UTM conversion, local tangent plane projection (`lib/geo_utils.py`) |
-
----
-
-## Development Guide
-
-### Project Structure
-
-```
-mpfc/
-├── main.py                     # Supervisor entrypoint
-├── config/
-│   └── bus_topics_schema.json  # Topic pattern definitions
-├── protocols/
-│   ├── registry.yaml           # Protocol registry
-│   ├── namespace_loader.py     # Dynamic protocol binding
-│   ├── uav.yaml                # UAV command/state vocabulary
-│   └── atak.yaml               # ATAK/CoT vocabulary
-├── lib/
-│   ├── common.py               # Config, topics, bus, waits
-│   ├── core_base.py            # CoreBase class
-│   ├── plugin_base.py          # PluginBase class
-│   ├── state_scheduler.py      # Rate-limited state publisher
-│   ├── mqtt_bus_client.py      # MQTT transport layer
-│   ├── geo_utils.py            # GPS/cartography utilities
-│   └── uav.py                  # PWM scaling helpers
-├── flight_cores/
-│   ├── test_core/              # Hello-world example
-│   ├── test_takeoff_land/      # Autonomous mission example
-│   ├── example_msp/            # MSP telemetry example
-│   ├── atak_example/           # ATAK monitor example
-│   └── yolo_example/           # YOLO detection example
-├── plugins/
-│   ├── uav_controller/        # UAV-agnostic flight layer
-│   ├── mavsdk_interface/       # PX4/MAVLink bridge
-│   ├── msp_interface/          # iNav/MSP bridge
-│   ├── atak_interface/         # ATAK/CoT bridge
-│   ├── hivelink_interface/     # Multi-transport datalink
-│   ├── yolo_detector/          # YOLO object detection
-│   └── example_hello/          # Echo test plugin
-├── run_px4_gz_mav_example.sh   # PX4 SITL launcher
-├── run_ardupilot_sitl_mav_example.sh # ArduPilot SITL launcher
-├── run_example_msp.sh          # MSP example launcher
-├── run_example.sh              # Basic example launcher
-└── requirements.txt
-```
-
-### Adding a New Protocol Token
-
-1. Add the token to the appropriate `protocols/*.json` schema
-2. Load it in your core/plugin: `UAV = load_protocol_namespace("uav")`
-3. Reference via `UAV.State.YourField` / `UAV.Action.YourAction` — never raw strings
-
-### Writing a New Flight Core
-
-1. Create `flight_cores/<name>/` with a main module and `config.yaml`
-2. Subclass `CoreBase` and implement `run()`
-3. Use `self.send_action()`, `self.wait_for_state()`, `self.state` for bus interaction
-
-### Writing a New Plugin
-
-1. Create `plugins/<name>/` with a main module and `config_template.yaml`
-2. Subclass `PluginBase` and implement `run()`
-3. Register state fields with `add_state_topics()` and a `StateScheduler`
-4. Handle incoming requests, publish responses via `enqueue_response()`
-
-### Rules of Thumb
-
-- Protocol tokens in `protocols/*.json` first, implementation second
-- Reusable wait/state/request patterns go in `lib/`, not duplicated per core
-- Mission-specific policy stays in flight cores
-- Device/protocol conversion stays in plugins
-- Cores should be linear and readable — push complexity downward
-
----
-
-## Dependencies
-
-| Package | Purpose |
-|---------|---------|
-| `mavsdk` | MAVLink communication with PX4 autopilots |
-| `pymavlink` | MAVLink message definitions and parsing |
-| `hivelink` | Multi-transport datalink protocol |
-| `frogproto` | Protocol buffer utilities |
-| `paho-mqtt` | MQTT client for the message bus |
-| `numpy` | Numerical computing (geo math, filtering) |
-| `filterpy` | Kalman filtering |
-| `simple-pid` | PID controller |
-| `PyYAML` | YAML config file parsing |
+Install Python dependencies and ensure Mosquitto is available:
 
 ```bash
 pip install -r requirements.txt
 ```
+
+Set `OCCID_PATH` if the OCCID repository is not a sibling of MPFC:
+
+```bash
+export OCCID_PATH=/path/to/occid
+```
+
+Runtime smoke test:
+
+```bash
+MAIN_CONFIG=flight_cores/test_core/config.yaml python main.py
+```
+
+PX4 SITL acceptance Program:
+
+```bash
+MAIN_CONFIG=flight_cores/test_takeoff_land/config_px4.yaml python main.py
+```
+
+ArduPilot/MAVSDK acceptance Program:
+
+```bash
+MAIN_CONFIG=flight_cores/test_takeoff_land/config.yaml python main.py
+```
+
+INAV/MSP telemetry example:
+
+```bash
+MAIN_CONFIG=flight_cores/example_msp/config.yaml python main.py
+```
+
+Liftoff telemetry example:
+
+```bash
+MAIN_CONFIG=flight_cores/example_liftoff/config.yaml python main.py
+```
+
+CoT/ATAK example:
+
+```bash
+MAIN_CONFIG=flight_cores/atak_example/config.yaml python main.py
+```
+
+## Lifecycle and supervision
+
+`main.py` starts the Program and plugins as separate processes and monitors diagnostics.
+
+```text
+DIAG/<id>/STARTING
+DIAG/<id>/ONLINE
+DIAG/<id>/STOPPED
+```
+
+A child crash or `DIAG/.../ERROR` triggers coordinated shutdown through `CONTROL/SHUTDOWN`.
+
+Shared runtime machinery lives under `lib/`:
+
+- `common.py` - config, topics, MQTT routing, waits, request correlation
+- `core_base.py` - current Program base class
+- `plugin_base.py` - plugin lifecycle/response helpers
+- `state_scheduler.py` - rate-limited state publishing
+- `occid_bus.py` - OCCID packing/unpacking and request helpers
+- `occid_topics.py` - local routing keys only
+- `uav_client.py` - Program-facing UAV convenience API
+- `geo_utils.py` / `reference_frames.py` - geometry/frame helpers
+
+## Development rules
+
+- Put operational meaning in OCCID, not MPFC-local schema files.
+- Programs express intent and policy.
+- Reusable capability logic belongs in plugins or small client facades.
+- Endpoint-specific protocol quirks belong at the endpoint adapter.
+- MQTT topics route messages; they do not define semantic types.
+- Keep frame/unit conversions explicit at protocol boundaries.
+- Do not create a Task/Execution lifecycle for high-rate low-level control samples.
+- Add OCCID model coverage when a real Program or adapter demonstrates the need for it.
+
+## Status
+
+MPFC is pre-1.0 and evolving quickly. The OCCID migration is intentionally replacing the old internal `protocols/` namespace system rather than maintaining both systems in parallel.
