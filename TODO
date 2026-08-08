@@ -1,5 +1,6 @@
-* Complete Program naming cleanup (`flight_cores` / `CoreBase` -> Program terminology)
-* Pi interface module for GPIO, Wi-Fi, BT, etc
-* Expand OCCID adapter coverage where real Programs require additional state or commands
-* Add executable integration coverage for MAVSDK/PX4, ArduPilot, MSP/INAV, CoT, and tracker paths
-* Evaluate a non-blocking/streaming path for high-rate immediate UAV commands such as 20 Hz `SetControlAttitudeCommand`; keep OCCID semantics unchanged
+# TODO
+
+- Rename historical `flight_cores/`, `CoreBase`, and `run_core()` surfaces to Program terminology once runtime behavior is stable.
+- Finish Raspberry Pi target/interface support.
+- Expand endpoint coverage only when a demonstrated OCCID concept is not yet represented; use `deep_ontology` as semantic reference rather than restoring its full taxonomy.
+- Add focused integration acceptance for direct-control sessions, asynchronous command result forwarding, and restored MSP state surfaces.

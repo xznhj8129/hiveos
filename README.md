@@ -37,12 +37,14 @@ The boundaries are intentional:
 
 - **Program** - the main thing being run: take off and land, turn tracker data into flight commands, patrol an area, operate a payload, etc.
 - **Plugin** - reusable functional API or external-system interface.
-- **`uav_controller`** - stable Program-facing UAV service. It applies reusable vehicle policy/readiness and speaks OCCID to Programs and endpoint adapters.
+- **`uav_controller`** - stable Program-facing UAV service. It applies reusable vehicle policy/readiness, accepts only immediate UAV OCCID command/input families, and speaks OCCID to Programs and endpoint adapters.
 - **Endpoint adapters** - translate OCCID directly to or from native mechanisms such as MAVSDK/MAVLink, MSP, or CoT.
 - **MQTT** - local IPC and routing only.
 - **OCCID** - semantic model. There is no separate MPFC UAV/ATAK/CV ontology.
 
 A component that translates OCCID into another internal MPFC semantic vocabulary is probably in the wrong place. A component that consumes OCCID, applies real policy or behavior, and emits OCCID is fine.
+
+Higher-level OCCID `Task`, `Plan`, `Assignment`, and `Execution` lifecycle semantics are intentionally not accepted by `uav_controller` merely because they ultimately derive from `Command`. They belong to the OCCID-native MPFC execution ingress that owns local Program selection and high-level execution.
 
 ## Program style
 
@@ -57,18 +59,33 @@ uav.return_to_launch()
 uav.land()
 ```
 
-The same Program-facing API can be backed by PX4/MAVSDK, ArduPilot/MAVSDK, INAV/MSP, or another future adapter without introducing another semantic protocol.
+Those convenience methods dispatch commands and return request IDs without blocking for an endpoint result. A Program that genuinely needs to wait can explicitly call `uav.execute(command)`.
+
+The same Program-facing API can be backed by PX4/MAVSDK, ArduPilot/MAVSDK, INAV/MSP, or another future adapter without introducing another semantic protocol or pretending that every endpoint has the same request/reply mechanics.
 
 `px4_guide` in `mpfc_additions` is the higher-rate example: tracker state and UAV state are OCCID, guidance math remains in radians, and attitude setpoints go through the UAV service. The MAVSDK adapter alone converts radians to MAVSDK's degree API.
 
+High-rate direct control is intentionally separate from command RPC. A Program begins a direct-control session, publishes latest-value OCCID `Input` samples, then ends the session:
+
+```python
+uav.begin_direct_control(occid.DirectControlMode.ATTITUDE_THRUST)
+uav.set_attitude(roll_rad, pitch_rad, yaw_rad, thrust)
+# ...more latest-value setpoints...
+uav.end_direct_control()
+```
+
+`ControlAttitudeSetpoint` and `ControlOverride` samples do not receive a request ID or per-sample response.
+
 ## OCCID
 
-OCCID is maintained separately in the `occid` repository. MPFC loads its generated Pydantic package either from:
+OCCID is maintained separately in the `occid` repository. MPFC imports the canonical `occid` Python SDK namespace and loads it either from:
 
 1. `OCCID_PATH`, pointing at the OCCID repository root, or
 2. a sibling `occid/` checkout beside the MPFC repository.
 
-Transient MQTT payloads render OCCID models directly as JSON-compatible fields, tagged with `_occid_model`, `_occid_model_id`, and `_occid_schema_version` so they remain typed and deterministic while still being readable in ordinary MQTT debugging tools. OCCID's versioned MsgPack `encode()` representation remains the compact binary representation for transports that actually need it.
+The generic top-level Python package name `schema` is no longer part of the MPFC consumer boundary.
+
+Transient MQTT payloads render OCCID models directly as JSON-compatible fields, tagged with `_occid_model`, `_occid_model_id`, and `_occid_schema_version` so they remain typed and deterministic while still being readable in ordinary MQTT debugging tools. OCCID's versioned MsgPack `encode()` representation remains the compact binary representation for transports that actually need it. The current semantic schema version is 4.
 
 Representative state streams include:
 
@@ -78,9 +95,12 @@ location
 attitude
 angular_velocity
 gnss
+autopilot_mission
 power
 imu
+sensor_config
 rc_telemetry
+remote_control
 control_override
 control_output
 runtime_load
@@ -91,16 +111,20 @@ cot_raw
 
 These strings are routing keys, not types. The tagged OCCID model inside `data` defines the semantics.
 
+The MSP adapter restores information that was accidentally dropped during the first OCCID cutover rather than treating awkward native data as disposable: receiver bounds, channel maps, mode ranges, RC state, GNSS diagnostics, onboard mission validity/capacity/current waypoint, and selected flight sensor hardware now have explicit OCCID representations. `SetWaypointCommand` also maps to the native MSP waypoint write.
+
 ## UAV path
 
 ```text
 Program
   |
-  | UavClient convenience API -> OCCID commands/state
+  | UavClient convenience API
+  |   commands -> REQUEST
+  |   direct-control samples -> INPUT
   v
 uav_controller
   |
-  | OCCID in / OCCID out
+  | type-gated OCCID in / OCCID out
   v
 selected endpoint adapter
   |
@@ -109,7 +133,14 @@ selected endpoint adapter
   +-- liftoff_interface -> simulator telemetry
 ```
 
-Examples of low-level OCCID commands include `ArmCommand`, `TakeoffCommand`, `GoToCommand`, `ReturnToLaunchCommand`, `SetControlAttitudeCommand`, and `SetControlOverrideCommand`. These are immediate control imperatives, not Task/Assignment/Execution lifecycle objects.
+Immediate UAV commands are decomposed by meaning:
+
+- `FlightCommand` - arm, disarm, takeoff, land, RTL, and takeoff-altitude configuration.
+- `NavigationCommand` - GoTo, waypoint write, and onboard mission selection.
+- `ModeCommand` - mode activation/deactivation. Takeoff, land, and RTL are not encoded as mode changes.
+- `DirectControlCommand` - begin/end a portable direct-control session.
+
+High-rate `ControlAttitudeSetpoint` and `ControlOverride` values are OCCID `Input` models rather than command wrappers. Endpoint adapters own the corresponding native lifecycle such as PX4/MAVSDK offboard, MAVSDK manual control, or MSP RC override.
 
 ## Reference-frame contract
 
@@ -120,9 +151,13 @@ MPFC follows these conventions unless an OCCID record explicitly states otherwis
 - angular values: radians
 - angular velocity: radians/second
 - altitude values: meters, positive upward, with explicit datum where needed
-- normalized control axes are protocol-independent; adapters own PWM/MAVSDK/native conversion
+- simultaneous absolute and relative altitude observations keep independent vertical datums
+- normalized pilot/control axes use signed `-1..+1` semantic control position
+- adapters own PWM/MAVSDK/native conversion, including endpoints with reversible throttle/thrust
 
 Frame fields may be optional in OCCID when context is genuinely sufficient, but code performing transforms or control must validate the frames it depends on. `test_takeoff_land` deliberately checks this contract.
+
+CoT `hae` is WGS84 ellipsoid height, not mean-sea-level altitude. CoT/TAK UID is also an external protocol identity, not an OCCID logical subject ID; the ATAK adapter keeps the correlation boundary explicit.
 
 ## Plugins
 
@@ -153,13 +188,13 @@ Every process is an MQTT peer. The outer envelope is runtime metadata, while `da
   "data": {
     "_occid_model": "LocationState",
     "_occid_model_id": 206,
-    "_occid_schema_version": [3, 0, 0],
+    "_occid_schema_version": [4, 0, 0],
     "inertial_frame": "NED",
     "body_frame": null,
     "position": {
       "_occid_model": "GlobalPosition",
       "_occid_model_id": 196,
-      "_occid_schema_version": [3, 0, 0],
+      "_occid_schema_version": [4, 0, 0],
       "lat": 45.5017,
       "lon": -73.5673,
       "alt": 37.2,
@@ -185,12 +220,13 @@ Common routing patterns:
 | --- | --- |
 | `CONTROL/<command>` | runtime lifecycle/control |
 | `SET/<client_id>` | runtime parameter mutation |
-| `<client>/<ns>/REQUEST` | correlated plugin request |
-| `<client>/<ns>/RESPONSE` | correlated plugin result |
+| `<client>/<ns>/REQUEST` | correlated command/plugin request |
+| `<client>/<ns>/RESPONSE` | eventual correlated result |
+| `<client>/<ns>/INPUT` | latest-value OCCID input stream, no per-sample response |
 | `<client>/<ns>/STATE/<route>` | rate-limited OCCID state stream |
 | `DIAG/<client>/<event>` | diagnostics and lifecycle |
 
-Request IDs, response correlation, timeouts, state-rate scheduling, and MQTT envelopes are IPC mechanics. They do not form a second semantic protocol.
+Request IDs, response correlation, timeouts, state-rate scheduling, and MQTT envelopes are IPC mechanics. They do not form a second semantic protocol. `uav_controller` forwards backend command results asynchronously rather than blocking its event loop. MSP remains free to use request/reply internally; MAVSDK/MAVLink and streamed controls are not forced into that mechanic.
 
 ## Vehicle/backend selection
 
@@ -282,7 +318,7 @@ Shared runtime machinery lives under `lib/`:
 - `core_base.py` - current Program base class
 - `plugin_base.py` - plugin lifecycle/response helpers
 - `state_scheduler.py` - rate-limited state publishing
-- `occid_bus.py` - OCCID packing/unpacking and request helpers
+- `occid_bus.py` - OCCID packing/unpacking plus command and input helpers
 - `occid_topics.py` - local routing keys only
 - `uav_client.py` - Program-facing UAV convenience API
 - `geo_utils.py` / `reference_frames.py` - geometry/frame helpers
@@ -290,13 +326,16 @@ Shared runtime machinery lives under `lib/`:
 ## Development rules
 
 - Put operational meaning in OCCID, not MPFC-local schema files.
+- Minimal OCCID means minimum demonstrated coverage, not shallow semantics. Use `deep_ontology` as a semantic reference quarry when a real requirement exposes a missing distinction.
 - Programs express intent and policy.
 - Reusable capability logic belongs in plugins or small client facades.
-- Endpoint-specific protocol quirks belong at the endpoint adapter.
+- `uav_controller` accepts only its declared immediate UAV command/input families; generic `Command` is not an authorization boundary.
+- Endpoint-specific protocol quirks and native lifecycle belong at the endpoint adapter.
+- Common semantics do not require common mechanics. Do not force request/reply, streaming, acknowledgements, or native control lifecycle to look identical across protocols.
 - MQTT topics route messages; they do not define semantic types.
-- Keep frame/unit conversions explicit at protocol boundaries.
-- Do not create a Task/Execution lifecycle for high-rate low-level control samples.
-- Add OCCID model coverage when a real Program or adapter demonstrates the need for it.
+- Keep frame/unit/datum/native-identity conversions explicit at protocol boundaries.
+- Do not create a Task/Execution lifecycle or synchronous RPC for high-rate direct-control samples.
+- Add OCCID model coverage when a real Program or adapter demonstrates the need for it, and preserve useful endpoint information rather than discarding it because it is inconvenient to map.
 
 ## Status
 

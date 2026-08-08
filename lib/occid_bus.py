@@ -17,25 +17,11 @@ from pathlib import Path
 from typing import Any
 
 
-def _is_occid_schema(module: Any) -> bool:
+def _is_occid_sdk(module: Any) -> bool:
     return hasattr(module, "OCCIDModel") and hasattr(module, "OCCID_MODEL_BY_ID")
 
 
-def _load_occid_schema():
-    try:
-        candidate = importlib.import_module("schema")
-        if _is_occid_schema(candidate):
-            return candidate
-    except ImportError:
-        pass
-
-    # A third-party package named `schema` is common. If one was imported above,
-    # remove only that non-OCCID module before trying the explicitly configured
-    # OCCID repository/package paths.
-    existing = sys.modules.get("schema")
-    if existing is not None and not _is_occid_schema(existing):
-        sys.modules.pop("schema", None)
-
+def _load_occid():
     candidates: list[Path] = []
     configured = os.environ.get("OCCID_PATH")
     if configured:
@@ -48,23 +34,23 @@ def _load_occid_schema():
         path_text = str(path.resolve())
         if path_text not in sys.path:
             sys.path.insert(0, path_text)
-        try:
-            candidate = importlib.import_module("schema")
-        except ImportError:
-            sys.modules.pop("schema", None)
-            continue
-        if _is_occid_schema(candidate):
-            return candidate
-        sys.modules.pop("schema", None)
 
-    searched = ", ".join(str(path) for path in candidates)
-    raise RuntimeError(
-        "OCCID schema package not found. Set OCCID_PATH to the OCCID repository root "
-        f"or place it beside MPFC. searched={searched}"
-    )
+    try:
+        candidate = importlib.import_module("occid")
+    except ImportError as exc:
+        searched = ", ".join(str(path) for path in candidates)
+        raise RuntimeError(
+            "OCCID Python SDK not found. Set OCCID_PATH to the OCCID repository root "
+            f"or place it beside MPFC. searched={searched}"
+        ) from exc
+    if not _is_occid_sdk(candidate):
+        raise RuntimeError(
+            f"imported module 'occid' is not the OCCID SDK module={getattr(candidate, '__file__', None)}"
+        )
+    return candidate
 
 
-occid = _load_occid_schema()
+occid = _load_occid()
 OCCID_MODEL_KEY = "_occid_model"
 OCCID_MODEL_ID_KEY = "_occid_model_id"
 OCCID_SCHEMA_KEY = "_occid_schema_version"
@@ -190,11 +176,7 @@ def _next_request_id(router: Any) -> str:
 
 
 def send_occid_request(router: Any, request_topic: str, model: Any) -> str:
-    """Send any OCCID model to a plugin request endpoint.
-
-    This is local IPC request/response correlation only; the model itself remains
-    the complete semantic payload.
-    """
+    """Send any OCCID model to a correlated plugin request endpoint."""
     if not is_occid_model(model):
         raise TypeError(f"expected OCCID model, got {type(model).__name__}")
     request_id = _next_request_id(router)
@@ -227,3 +209,19 @@ def decode_occid_command(request: dict[str, Any]) -> tuple[str, Any]:
     if not isinstance(command, occid.Command):
         raise TypeError(f"request payload is not OCCID Command actual={type(command).__name__}")
     return request_id, command
+
+
+def send_occid_input(router: Any, input_topic: str, input_model: Any) -> None:
+    """Publish one latest-value OCCID Input sample without request/response correlation."""
+    if not isinstance(input_model, occid.Input):
+        raise TypeError(f"expected OCCID Input, got {type(input_model).__name__}")
+    from lib.common import build_envelope
+
+    router.publish(input_topic, build_envelope(router.client_id, input_topic, pack_occid(input_model)))
+
+
+def decode_occid_input(payload: Any) -> Any:
+    model = unpack_occid(payload)
+    if not isinstance(model, occid.Input):
+        raise TypeError(f"input payload is not OCCID Input actual={type(model).__name__}")
+    return model

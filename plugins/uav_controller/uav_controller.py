@@ -2,8 +2,9 @@
 """OCCID-native UAV service plugin.
 
 Programs talk to this plugin as the stable UAV API. It applies reusable
-vehicle-level policy and forwards OCCID commands/state to the selected endpoint
-adapter without introducing another semantic vocabulary.
+vehicle-level policy, type-gates immediate UAV command families, forwards
+commands without blocking on endpoint mechanics, and relays high-rate OCCID
+Input samples on a latest-value path.
 """
 
 from __future__ import annotations
@@ -21,17 +22,32 @@ from lib.common import (
     build_state_topics,
     build_topic_base,
 )
-from lib.occid_bus import decode_occid_command, occid, pack_occid, send_occid_command, unpack_occid
+from lib.occid_bus import (
+    decode_occid_command,
+    decode_occid_input,
+    occid,
+    pack_occid,
+    send_occid_command,
+    send_occid_input,
+    unpack_occid,
+)
 from lib.occid_topics import FLIGHT_CONTROL, LOCATION
 from lib.plugin_base import PluginBase
 
 
-class ControllerActionError(RuntimeError):
-    pass
-
-
 class UavController(PluginBase):
-    """Backend-independent UAV service built on OCCID commands and state."""
+    """Backend-independent UAV service built on OCCID commands, inputs, and state."""
+
+    IMMEDIATE_COMMAND_TYPES = (
+        occid.FlightCommand,
+        occid.NavigationCommand,
+        occid.ModeCommand,
+        occid.DirectControlCommand,
+    )
+    DIRECT_INPUT_TYPES = (
+        occid.ControlAttitudeSetpoint,
+        occid.ControlOverride,
+    )
 
     def __init__(self, cfg: Dict[str, Any], bus_config: Dict[str, Any]) -> None:
         super().__init__(cfg, bus_config)
@@ -45,17 +61,21 @@ class UavController(PluginBase):
         self.arm_ready_since: float | None = None
         self.takeoff_ready_since: float | None = None
         self.backend_flight_control: Any | None = None
+        self.pending_backend_requests: dict[str, tuple[str, str, float]] = {}
 
         base = build_topic_base(self.client_id, self.topic_ns)
         self.request_topic = build_request_topic(self.client_id, self.topic_ns)
         self.response_topic = build_response_topic(self.client_id, self.topic_ns)
+        self.input_topic = f"{base}/INPUT"
         self.state_publish_topics = build_state_topics(base, self.backend_state_keys)
         self.event_topics = build_event_topics(base, self.backend_event_keys)
         self.client.subscribe(self.request_topic)
+        self.client.subscribe(self.input_topic)
 
         backend_base = build_topic_base(self.backend["id"], self.backend["topic_ns"])
         self.backend_request_topic = build_request_topic(self.backend["id"], self.backend["topic_ns"])
         self.backend_response_topic = build_response_topic(self.backend["id"], self.backend["topic_ns"])
+        self.backend_input_topic = f"{backend_base}/INPUT"
         self.backend_state_topics = build_state_topics(backend_base, self.backend_state_keys)
         self.backend_state_topic_to_key = {topic: key for key, topic in self.backend_state_topics.items()}
         self.backend_event_topics = build_event_topics(backend_base, self.backend_event_keys)
@@ -140,6 +160,37 @@ class UavController(PluginBase):
         model = self._apply_readiness_policy(self.backend_flight_control)
         self._publish_state(FLIGHT_CONTROL, pack_occid(model))
 
+    def _forward_backend_response(self, payload: Dict[str, Any]) -> None:
+        backend_request_id = str(payload["request_id"])
+        pending = self.pending_backend_requests.pop(backend_request_id, None)
+        self.responses.pop(backend_request_id, None)
+        if pending is None:
+            return
+        request_id, command_name, _ = pending
+        self.enqueue_response(
+            request_id,
+            command_name,
+            bool(payload.get("ok")),
+            dict(payload.get("data") or {}),
+        )
+
+    def _expire_pending_requests(self) -> None:
+        now = time.monotonic()
+        expired = [
+            backend_request_id
+            for backend_request_id, (_, _, created_at) in self.pending_backend_requests.items()
+            if now - created_at > self.response_timeout_s
+        ]
+        for backend_request_id in expired:
+            request_id, command_name, _ = self.pending_backend_requests.pop(backend_request_id)
+            self.responses.pop(backend_request_id, None)
+            self.enqueue_response(
+                request_id,
+                command_name,
+                False,
+                {"error": f"backend result timed out request_id={backend_request_id}"},
+            )
+
     def _pump_controller_once(self, deadline: float | None = None) -> tuple[Any, Any]:
         topic, payload = self._pump_once(deadline)
         if topic in self.backend_state_topic_to_key:
@@ -157,48 +208,67 @@ class UavController(PluginBase):
                 self._publish_state(state_key, state_payload)
                 if state_key == LOCATION:
                     self._publish_controller_flight_control()
+        elif topic == self.backend_response_topic:
+            self._forward_backend_response(payload["data"])
         elif topic in self.backend_event_topic_to_key:
             self._publish_event(self.backend_event_topic_to_key[topic], payload["data"])
         return topic, payload
 
-    def _wait_backend_response(self, request_id: str, timeout_s: float) -> Dict[str, Any]:
-        deadline = time.monotonic() + float(timeout_s)
-        while True:
-            if request_id in self.responses:
-                return self.responses.pop(request_id)
-            if time.monotonic() > deadline:
-                raise ControllerActionError(f"backend response wait timed out request_id={request_id}")
-            self._pump_controller_once(deadline)
-
-    def _send_backend_command(self, command: Any) -> Dict[str, Any]:
-        backend_request_id = send_occid_command(self.bus, self.backend_request_topic, command)
-        return self._wait_backend_response(backend_request_id, self.response_timeout_s)
-
     def _handle_request(self, request: Dict[str, Any]) -> None:
-        request_id, command = decode_occid_command(request)
+        request_id = str(request.get("request_id", "unknown"))
+        command_name = "Command"
         try:
-            backend_response = self._send_backend_command(command)
-            self.enqueue_response(
+            request_id, command = decode_occid_command(request)
+            command_name = type(command).__name__
+            if not isinstance(command, self.IMMEDIATE_COMMAND_TYPES):
+                allowed = ", ".join(command_type.__name__ for command_type in self.IMMEDIATE_COMMAND_TYPES)
+                raise TypeError(
+                    f"uav_controller accepts immediate UAV command families only allowed={allowed} actual={command_name}"
+                )
+            backend_request_id = send_occid_command(self.bus, self.backend_request_topic, command)
+            self.pending_backend_requests[backend_request_id] = (
                 request_id,
-                type(command).__name__,
-                bool(backend_response.get("ok")),
-                dict(backend_response.get("data") or {}),
+                command_name,
+                time.monotonic(),
             )
-        except (ControllerActionError, TypeError, ValueError) as exc:
-            self.enqueue_response(request_id, type(command).__name__, False, {"error": str(exc)})
+        except (TypeError, ValueError, KeyError) as exc:
+            self.enqueue_response(request_id, command_name, False, {"error": str(exc)})
+
+    def _handle_input(self, payload: Any) -> None:
+        model = decode_occid_input(payload)
+        if not isinstance(model, self.DIRECT_INPUT_TYPES):
+            allowed = ", ".join(input_type.__name__ for input_type in self.DIRECT_INPUT_TYPES)
+            raise TypeError(
+                f"uav_controller accepts direct UAV input types only allowed={allowed} actual={type(model).__name__}"
+            )
+        send_occid_input(self.bus, self.backend_input_topic, model)
 
     def run(self) -> None:
         self.send_online()
         try:
             while True:
                 self.flush_queue(self.response_queue, self.response_topic)
+                self._expire_pending_requests()
                 deadline = time.monotonic() + self.poll_interval_s
                 topic, payload = self._pump_controller_once(deadline)
                 if topic is None:
                     continue
                 if topic == self.request_topic:
                     self._handle_request(payload["data"])
-                    self.flush_queue(self.response_queue, self.response_topic)
+                elif topic == self.input_topic:
+                    try:
+                        self._handle_input(payload["data"])
+                    except (TypeError, ValueError, KeyError) as exc:
+                        error_topic = f"DIAG/{self.client_id}/INPUT_REJECTED"
+                        self.client.publish(
+                            error_topic,
+                            build_envelope(
+                                self.client_id,
+                                error_topic,
+                                {"event": "INPUT_REJECTED", "error": str(exc)},
+                            ),
+                        )
+                self.flush_queue(self.response_queue, self.response_topic)
         except RuntimeError:
             self.publish_error(traceback.format_exc().strip())
             raise

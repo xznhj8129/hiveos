@@ -23,11 +23,12 @@ from interop.msp import (
     rc_sequence_to_control_axes,
     standard_mode_from_native_names,
 )
-from lib.common import apply_cfg, build_request_topic, build_response_topic, build_state_scheduler_topics, build_topic_base
-from lib.occid_bus import decode_occid_command, occid, pack_occid
+from lib.common import apply_cfg, build_envelope, build_request_topic, build_response_topic, build_state_scheduler_topics, build_topic_base
+from lib.occid_bus import decode_occid_command, decode_occid_input, occid, pack_occid
 from lib.occid_topics import (
     ANGULAR_VELOCITY,
     ATTITUDE,
+    AUTOPILOT_MISSION,
     CONTROL_OUTPUT,
     CONTROL_OVERRIDE,
     FLIGHT_CONTROL,
@@ -36,7 +37,9 @@ from lib.occid_topics import (
     LOCATION,
     POWER,
     RC_TELEMETRY,
+    REMOTE_CONTROL,
     RUNTIME_LOAD,
+    SENSOR_CONFIG,
 )
 from lib.plugin_base import PluginBase
 from lib.state_scheduler import StateScheduler
@@ -59,7 +62,9 @@ class MspInterface(PluginBase):
         base = build_topic_base(self.client_id, self.topic_ns)
         self.request_topic = build_request_topic(self.client_id, self.topic_ns)
         self.response_topic = build_response_topic(self.client_id, self.topic_ns)
+        self.input_topic = f"{base}/INPUT"
         self.client.subscribe(self.request_topic)
+        self.client.subscribe(self.input_topic)
         self.init_bus(POLL_INTERVAL_S)
         self.state_scheduler = StateScheduler(
             self.client,
@@ -86,19 +91,31 @@ class MspInterface(PluginBase):
             self.sensor_config = self.api.get_sensor_config()
             self.rx_config = self.api.get_rx_config()
             self.rx_map = self.api.get_rx_map()
-            mode_ranges = self.api.get_mode_ranges()
+            self.mode_ranges = self.api.get_mode_ranges()
         print(
             f"[PLUGIN_CONN] id={self.client_id} type={self.conn_type} conn={self.conn_str} baud={self.conn_bitrate}",
             flush=True,
         )
 
         self.mode_channels: Dict[str, Dict[str, Any]] = {}
-        for entry in mode_ranges:
-            aux_index = entry["auxChannelIndex"]
+        for entry in self.mode_ranges:
+            aux_index = int(entry["auxChannelIndex"])
             channel_index = aux_index + 4
             channel_name = self.api.chmap[channel_index] if channel_index < len(self.api.chmap) else f"ch{channel_index + 1}"
             pwm_start, pwm_end = entry["pwmRange"]
-            self.mode_channels[entry["mode"]] = {"channel": channel_name, "pwm": int((pwm_start + pwm_end) / 2)}
+            self.mode_channels[str(entry["mode"])] = {
+                "channel": channel_name,
+                "pwm": int((pwm_start + pwm_end) / 2),
+            }
+
+        self.receiver_config_model = occid.ReceiverConfig(
+            rx_min_usec=int(self.rx_config["rxMinUsec"]),
+            rx_max_usec=int(self.rx_config["rxMaxUsec"]),
+            rx_center_usec=int(self.rx_config["midRc"]),
+        )
+        self.channel_map_models = self._build_channel_map_models()
+        self.mode_range_models = self._build_mode_range_models()
+        self.sensor_config_model = self._build_sensor_config_model()
 
         self.arm_mode_name = "ARM"
         self.override_mode_name = "MSP RC OVERRIDE"
@@ -106,6 +123,7 @@ class MspInterface(PluginBase):
         self.control_override: Any | None = None
         self.control_override_lock = threading.Lock()
         self.control_override_updated_at = 0.0
+        self.direct_control_mode: Any | None = None
         self.latest_flight_control: Any | None = None
         self.latest_location: Any | None = None
         self.latest_rc: Any | None = None
@@ -119,8 +137,64 @@ class MspInterface(PluginBase):
         self.worker_threads: Dict[str, threading.Thread] = {}
         self.shutdown_requested = False
 
-        self._activate_override()
+        # Starting an adapter is observation, not acquisition of control authority.
         self._refresh_state()
+
+    def _build_channel_map_models(self) -> list[Any]:
+        axis_by_name = {
+            "roll": occid.ControlAxis.ROLL,
+            "pitch": occid.ControlAxis.PITCH,
+            "yaw": occid.ControlAxis.YAW,
+            "throttle": occid.ControlAxis.THROTTLE,
+        }
+        models: list[Any] = []
+        for source_index, entry in sorted(self.rx_map.items(), key=lambda item: int(item[0])):
+            name = str(entry.get("name", f"ch{int(source_index) + 1}"))
+            models.append(
+                occid.ChannelMapEntry(
+                    axis=axis_by_name.get(name.lower(), occid.ControlAxis.AUX),
+                    source_channel=int(source_index),
+                    output_channel=None if entry.get("mappedTo") is None else int(entry["mappedTo"]),
+                    label=name,
+                )
+            )
+        return models
+
+    def _build_mode_range_models(self) -> list[Any]:
+        models: list[Any] = []
+        for entry in self.mode_ranges:
+            pwm_start, pwm_end = entry["pwmRange"]
+            models.append(
+                occid.ModeRange(
+                    mode_id=None if entry.get("permanentId") is None else int(entry["permanentId"]),
+                    mode_name=str(entry["mode"]),
+                    channel=int(entry["auxChannelIndex"]) + 4,
+                    range=occid.NumericRange(min_value=float(pwm_start), max_value=float(pwm_end)),
+                )
+            )
+        return models
+
+    @staticmethod
+    def _native_name(value: Any) -> str | None:
+        if value is None:
+            return None
+        return str(getattr(value, "name", value))
+
+    def _build_sensor_config_model(self) -> Any:
+        return occid.FlightSensorConfiguration(
+            accelerometer=self._native_name(self.sensor_config.get("accHardware")),
+            barometer=self._native_name(self.sensor_config.get("baroHardware")),
+            magnetometer=self._native_name(self.sensor_config.get("magHardware")),
+            airspeed=self._native_name(self.sensor_config.get("pitotHardware")),
+            rangefinder=self._native_name(self.sensor_config.get("rangefinderHardware")),
+            optical_flow=self._native_name(self.sensor_config.get("opflowHardware")),
+        )
+
+    @staticmethod
+    def _box_display_name(mode: Any) -> str:
+        permanent_id = int(mode.value)
+        definition = boxes.MODEBOXES.get(permanent_id)
+        return mode.name if definition is None else str(definition["boxName"])
 
     def _capture_loop_error(self, source: str, exc: BaseException) -> None:
         if self.loop_error is not None:
@@ -149,6 +223,17 @@ class MspInterface(PluginBase):
         if self._stream_enabled(key):
             self.state_scheduler.update(key, pack_occid(model))
 
+    def _publish_input_rejected(self, model: Any, error: str) -> None:
+        topic = f"DIAG/{self.client_id}/INPUT_REJECTED"
+        self.client.publish(
+            topic,
+            build_envelope(
+                self.client_id,
+                topic,
+                {"event": "INPUT_REJECTED", "model": type(model).__name__, "error": error},
+            ),
+        )
+
     def _respond(self, request_id: str, command: Any, ok: bool, data: Dict[str, Any] | None = None, error: str | None = None) -> None:
         payload = {} if data is None else dict(data)
         if error is not None:
@@ -157,10 +242,11 @@ class MspInterface(PluginBase):
 
     def _activate_override(self) -> None:
         if self.override_mode_name in self.mode_channels:
-            channel = self.mode_channels[self.override_mode_name]["channel"]
-            pwm = self.mode_channels[self.override_mode_name]["pwm"]
-            with self.api_lock:
-                self.api.set_rc_channels({channel: pwm})
+            self._apply_mode(self.override_mode_name)
+
+    def _deactivate_override(self) -> None:
+        if self.override_mode_name in self.mode_channels:
+            self._clear_mode(self.override_mode_name)
 
     def _apply_mode(self, mode_name: str) -> None:
         if mode_name not in self.mode_channels:
@@ -183,20 +269,25 @@ class MspInterface(PluginBase):
                 return candidate
         raise UnsupportedCommand(f"none of native modes configured candidates={candidates}")
 
-    def _set_standard_mode(self, mode: Any) -> None:
+    def _standard_mode_native_name(self, mode: Any) -> str:
         if mode == occid.StandardFlightMode.POSITION_HOLD:
-            self._apply_mode(self._find_mode(("NAV POSHOLD", "POSHOLD")))
-            return
-        if mode == occid.StandardFlightMode.SAFE_RECOVERY:
-            self._apply_mode(self._find_mode(("RTH", "NAV RTH", "NAV_RTH")))
-            return
+            return self._find_mode(("NAV POSHOLD", "POSHOLD"))
         if mode == occid.StandardFlightMode.MISSION:
-            self._apply_mode(self._find_mode(("NAV WP", "NAV_WP")))
-            return
-        if mode == occid.StandardFlightMode.LAND:
-            self._apply_mode(self._find_mode(("NAV LAND", "LAND")))
-            return
-        raise UnsupportedCommand(f"MSP adapter does not map standard mode {mode}")
+            return self._find_mode(("NAV WP", "NAV_WP"))
+        if mode == occid.StandardFlightMode.ALTITUDE_HOLD:
+            return self._find_mode(("NAV ALTHOLD", "ALTHOLD", "ALT HOLD"))
+        if mode == occid.StandardFlightMode.CRUISE:
+            return self._find_mode(("NAV CRUISE", "CRUISE"))
+        raise UnsupportedCommand(
+            f"MSP mode command does not map standard mode {mode}; use dedicated flight actions for RTL/land/takeoff"
+        )
+
+    def _set_standard_mode(self, mode: Any, enabled: bool) -> None:
+        native_name = self._standard_mode_native_name(mode)
+        if enabled:
+            self._apply_mode(native_name)
+        else:
+            self._clear_mode(native_name)
 
     def _set_throttle(self, value: int) -> None:
         with self.api_lock:
@@ -221,11 +312,19 @@ class MspInterface(PluginBase):
                 pwm_max_us=self.rx_config["rxMaxUsec"],
             )
         if type(rc_channels) is list:
-            return rc_sequence_to_control_axes(rc_channels)
+            return rc_sequence_to_control_axes(
+                rc_channels,
+                pwm_min_us=self.rx_config["rxMinUsec"],
+                pwm_max_us=self.rx_config["rxMaxUsec"],
+            )
         raise RuntimeError(f"unsupported rc_channels type {type(rc_channels).__name__}")
 
     def _override_is_fresh(self) -> bool:
-        return self.control_override is not None and time.monotonic() - self.control_override_updated_at <= float(self.control_override_timeout_s)
+        return (
+            self.direct_control_mode == occid.DirectControlMode.MANUAL_AXIS
+            and self.control_override is not None
+            and time.monotonic() - self.control_override_updated_at <= float(self.control_override_timeout_s)
+        )
 
     def _merge_override(self, base: Any, override: Any) -> Any:
         update: dict[str, Any] = {}
@@ -276,6 +375,8 @@ class MspInterface(PluginBase):
             analog = self.api.get_inav_analog()
             alt = self.api.get_altitude()
             gps = self.api.get_raw_gps()
+            gps_statistics = self.api.get_gps_statistics()
+            waypoint_info = self.api.get_waypoint_info()
             nav_status = self.api.get_nav_status()
             attitude = self.api.get_attitude()
             imu = self.api.get_imu()
@@ -286,7 +387,7 @@ class MspInterface(PluginBase):
         is_in_air = is_armed and relative_alt_m is not None and relative_alt_m >= float(self.in_air_alt_threshold)
         global_ok = gps["fixType"] == InavEnums.gpsFixType_e.GPS_FIX_3D and gps["numSat"] >= int(self.home_min_satellites)
         active_modes = status["activeModes"]
-        active_mode_names = [mode.name for mode in active_modes]
+        active_mode_names = [self._box_display_name(mode) for mode in active_modes]
         active_mode_ids = [int(mode.value) for mode in active_modes]
         override_active = boxes.BoxEnum.BOXMSPRCOVERRIDE in active_modes
         failsafe = boxes.BoxEnum.BOXFAILSAFE in active_modes
@@ -342,13 +443,35 @@ class MspInterface(PluginBase):
                 satellites_used=int(gps["numSat"]),
                 ground_speed_m_s=None if gps.get("speed") is None else float(gps["speed"]),
                 ground_course_deg=None if gps.get("groundCourse") is None else float(gps["groundCourse"]),
-                hdop=None if gps.get("hdop") is None else float(gps["hdop"]),
+                hdop=None if gps_statistics.get("hdop") is None else float(gps_statistics["hdop"]),
             ),
             navigation_validity=nav_validity,
+        )
+        gnss = gnss.model_copy(
+            update={
+                "eph": gps_statistics.get("eph"),
+                "epv": gps_statistics.get("epv"),
+                "last_message_dt": gps_statistics.get("lastMessageDt"),
+                "errors": gps_statistics.get("errors"),
+                "timeouts": gps_statistics.get("timeouts"),
+            }
         )
         self.latest_location = location
         self._publish_model(LOCATION, location)
         self._publish_model(GNSS, gnss)
+
+        active_waypoint = nav_status.get("activeWaypoint") or {}
+        self._publish_model(
+            AUTOPILOT_MISSION,
+            occid.AutopilotMissionState(
+                valid=bool(waypoint_info.get("missionValid")),
+                current_waypoint_index=None if active_waypoint.get("number") is None else int(active_waypoint["number"]),
+                waypoint_count=None if waypoint_info.get("waypointCount") is None else int(waypoint_info["waypointCount"]),
+                max_waypoints=None if waypoint_info.get("maxWaypoints") is None else int(waypoint_info["maxWaypoints"]),
+                waypoints_remaining=None if waypoint_info.get("waypointsRemaining") is None else int(waypoint_info["waypointsRemaining"]),
+            ),
+        )
+        self._publish_model(SENSOR_CONFIG, self.sensor_config_model)
 
         attitude_state = attitude_from_degrees(
             float(attitude["roll"]),
@@ -390,6 +513,17 @@ class MspInterface(PluginBase):
             self._publish_model(CONTROL_OVERRIDE, override)
         output = self._merge_override(rc, override) if override is not None and self._override_is_fresh() else rc
         self._publish_model(CONTROL_OUTPUT, output)
+        self._publish_model(
+            REMOTE_CONTROL,
+            occid.RemoteControlSchema(
+                rc_telemetry=rc,
+                control_output=output,
+                control_override=override,
+                receiver_config=self.receiver_config_model,
+                channel_map=self.channel_map_models,
+                mode_ranges=self.mode_range_models,
+            ),
+        )
 
     def _state_loop(self) -> None:
         try:
@@ -438,24 +572,87 @@ class MspInterface(PluginBase):
                 flag=int(self.go_to_waypoint["Flag"]),
             )
 
+    def _set_waypoint(self, command: Any) -> None:
+        waypoint = command.waypoint
+        if waypoint.action_code is None:
+            raise UnsupportedCommand("SetWaypointCommand requires action_code for MSP")
+        if waypoint.position.alt_frame != occid.AltitudeDatum.RELATIVE:
+            raise UnsupportedCommand(
+                f"MSP waypoint write currently requires RELATIVE altitude actual={waypoint.position.alt_frame}"
+            )
+        with self.api_lock:
+            self.api.set_waypoint(
+                waypointIndex=int(waypoint.waypoint_index),
+                action=InavEnums.navWaypointActions_e(int(waypoint.action_code)),
+                latitude=float(waypoint.position.lat),
+                longitude=float(waypoint.position.lon),
+                altitude=float(waypoint.position.alt),
+                param1=0 if waypoint.param1 is None else int(waypoint.param1),
+                param2=0 if waypoint.param2 is None else int(waypoint.param2),
+                param3=0 if waypoint.param3 is None else int(waypoint.param3),
+                flag=0 if waypoint.flag is None else int(waypoint.flag),
+            )
+
+    def _begin_direct_control(self, command: Any) -> None:
+        if command.mode != occid.DirectControlMode.MANUAL_AXIS:
+            raise UnsupportedCommand(f"MSP adapter supports MANUAL_AXIS direct control only actual={command.mode}")
+        if self.direct_control_mode is not None and self.direct_control_mode != command.mode:
+            raise UnsupportedCommand(
+                f"direct-control session already active mode={self.direct_control_mode}; end it before switching"
+            )
+        self.direct_control_mode = command.mode
+        self._activate_override()
+
+    def _end_direct_control(self) -> None:
+        self.direct_control_mode = None
+        with self.control_override_lock:
+            self.control_override = None
+            self.control_override_updated_at = 0.0
+        self._deactivate_override()
+
+    def _handle_input(self, payload: Any) -> None:
+        model = decode_occid_input(payload)
+        if isinstance(model, occid.ControlOverride):
+            if self.direct_control_mode != occid.DirectControlMode.MANUAL_AXIS:
+                self._publish_input_rejected(model, "ControlOverride requires active MANUAL_AXIS direct-control session")
+                return
+            with self.control_override_lock:
+                self.control_override = model
+                self.control_override_updated_at = time.monotonic()
+            return
+        self._publish_input_rejected(model, f"unsupported MSP direct input {type(model).__name__}")
+
     def _handle_command(self, request: Dict[str, Any]) -> None:
         request_id, command = decode_occid_command(request)
         try:
             if isinstance(command, occid.SetTakeoffAltitudeCommand):
                 self.takeoff_altitude_m = float(command.relative_altitude_m)
-            elif isinstance(command, occid.SetControlOverrideCommand):
-                with self.control_override_lock:
-                    self.control_override = command.override
-                    self.control_override_updated_at = time.monotonic()
             elif isinstance(command, occid.ReturnToLaunchCommand):
-                self._apply_mode(self._find_mode(("RTH", "NAV RTH", "NAV_RTH")))
+                self._apply_mode(self._find_mode(("NAV RTH", "RTH", "NAV_RTH")))
             elif isinstance(command, occid.SetModeCommand):
+                selectors = sum(
+                    selector is not None
+                    for selector in (command.standard_mode, command.native_mode_name, command.native_mode_code)
+                )
+                if selectors != 1:
+                    raise UnsupportedCommand("SetModeCommand requires exactly one standard/native selector")
                 if command.native_mode_name is not None:
-                    self._apply_mode(str(command.native_mode_name))
+                    if command.enabled:
+                        self._apply_mode(str(command.native_mode_name))
+                    else:
+                        self._clear_mode(str(command.native_mode_name))
                 elif command.standard_mode is not None:
-                    self._set_standard_mode(command.standard_mode)
+                    self._set_standard_mode(command.standard_mode, bool(command.enabled))
                 else:
-                    raise UnsupportedCommand("SetModeCommand requires standard or native mode")
+                    raise UnsupportedCommand("MSP adapter does not support numeric native mode selection")
+            elif isinstance(command, occid.SetWaypointCommand):
+                self._set_waypoint(command)
+            elif isinstance(command, occid.SelectMissionCommand):
+                raise UnsupportedCommand("MSP exposes onboard mission state but does not provide a mission-bank selection primitive")
+            elif isinstance(command, occid.BeginDirectControlCommand):
+                self._begin_direct_control(command)
+            elif isinstance(command, occid.EndDirectControlCommand):
+                self._end_direct_control()
             elif isinstance(command, occid.ArmCommand):
                 self._activate_override()
                 self._apply_mode(self.arm_mode_name)
@@ -469,7 +666,7 @@ class MspInterface(PluginBase):
             elif isinstance(command, occid.GoToCommand):
                 self._set_goto(command)
             else:
-                raise UnsupportedCommand(f"unsupported OCCID command {type(command).__name__}")
+                raise UnsupportedCommand(f"unsupported OCCID UAV command {type(command).__name__}")
             self._respond(request_id, command, True)
         except (UnsupportedCommand, ValueError, TypeError) as exc:
             self._respond(request_id, command, False, error=str(exc))
@@ -546,6 +743,11 @@ class MspInterface(PluginBase):
                     break
                 if topic == self.request_topic:
                     self.request_queue.put(payload["data"])
+                elif topic == self.input_topic:
+                    try:
+                        self._handle_input(payload["data"])
+                    except (TypeError, ValueError, KeyError) as exc:
+                        self._publish_input_rejected(payload["data"], str(exc))
         except KeyboardInterrupt:
             pass
         finally:

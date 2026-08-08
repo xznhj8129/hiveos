@@ -45,9 +45,12 @@ cfg:
     attitude: 0.1
     angular_velocity: 0.1
     gnss: 0.5
+    autopilot_mission: 0.5
     power: 0.5
     imu: 0.2
+    sensor_config: 1.0
     rc_telemetry: 0.2
+    remote_control: 0.5
     control_override: 0.2
     control_output: 0.2
     runtime_load: 0.5
