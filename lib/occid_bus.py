@@ -1,8 +1,9 @@
 """OCCID transport helpers for the MPFC MQTT runtime.
 
-OCCID remains the semantic model. MQTT envelopes only carry OCCID's own
-versioned MsgPack encoding as base64 so the JSON MQTT wrapper does not invent a
-second representation of OCCID.
+The local MQTT bus intentionally stays JSON-readable for debugging and
+inspection. OCCID models are rendered directly into JSON-compatible fields with
+small type/version tags; OCCID's MsgPack ``encode()`` remains available for
+binary transports that actually need a compact wire representation.
 """
 
 from __future__ import annotations
@@ -11,10 +12,9 @@ import base64
 import importlib
 import os
 import sys
+from enum import Enum, IntEnum as StdIntEnum
 from pathlib import Path
 from typing import Any
-
-import msgpack
 
 
 def _is_occid_schema(module: Any) -> bool:
@@ -65,30 +65,111 @@ def _load_occid_schema():
 
 
 occid = _load_occid_schema()
-OCCID_PAYLOAD_KEY = "occid_b64"
+OCCID_MODEL_KEY = "_occid_model"
+OCCID_MODEL_ID_KEY = "_occid_model_id"
+OCCID_SCHEMA_KEY = "_occid_schema_version"
+OCCID_BYTES_KEY = "_bytes_b64"
+OCCID_META_KEYS = {OCCID_MODEL_KEY, OCCID_MODEL_ID_KEY, OCCID_SCHEMA_KEY}
 
 
 def is_occid_model(value: Any) -> bool:
     return isinstance(value, occid.OCCIDModel)
 
 
-def pack_occid(model: Any) -> dict[str, str]:
+def _to_bus_value(value: Any) -> Any:
+    if is_occid_model(value):
+        return _pack_occid_model(value)
+    if isinstance(value, StdIntEnum):
+        return value.name
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, bytes):
+        return {OCCID_BYTES_KEY: base64.b64encode(value).decode("ascii")}
+    if type(value) == dict:
+        return {key: _to_bus_value(item) for key, item in value.items()}
+    if type(value) in (list, tuple):
+        return [_to_bus_value(item) for item in value]
+    return value
+
+
+def _pack_occid_model(model: Any) -> dict[str, Any]:
+    model_type = type(model)
+    model_id = occid.OCCID_MODEL_ID_BY_CLASS.get(model_type)
+    if model_id is None:
+        raise ValueError(f"OCCID model has no registered model id type={model_type.__name__}")
+    payload = {
+        OCCID_MODEL_KEY: model_type.__name__,
+        OCCID_MODEL_ID_KEY: int(model_id),
+        OCCID_SCHEMA_KEY: list(occid.OCCID_SCHEMA_VERSION),
+    }
+    payload.update(
+        {
+            field_name: _to_bus_value(getattr(model, field_name))
+            for field_name in model_type.model_fields
+        }
+    )
+    return payload
+
+
+def pack_occid(model: Any) -> dict[str, Any]:
+    """Render an OCCID model as inspectable JSON-compatible bus data."""
     if not is_occid_model(model):
         raise TypeError(f"expected OCCID model, got {type(model).__name__}")
-    encoded = model.encode()
-    return {OCCID_PAYLOAD_KEY: base64.b64encode(encoded).decode("ascii")}
+    return _pack_occid_model(model)
 
 
-def unpack_occid(payload: Any) -> Any:
-    if type(payload) is not dict or set(payload) != {OCCID_PAYLOAD_KEY}:
-        raise ValueError(f"invalid OCCID bus payload type={type(payload).__name__}")
-    encoded = base64.b64decode(payload[OCCID_PAYLOAD_KEY], validate=True)
-    envelope = msgpack.unpackb(encoded, raw=False)
-    model_id = int(envelope["model_id"])
+def _bus_model_to_wire(payload: dict[str, Any]) -> tuple[type, dict[str, Any]]:
+    if not OCCID_META_KEYS.issubset(payload):
+        raise ValueError("invalid OCCID bus payload: missing model metadata")
+
+    version = tuple(payload[OCCID_SCHEMA_KEY])
+    if version != occid.OCCID_SCHEMA_VERSION:
+        raise ValueError(
+            f"unsupported OCCID schema version {version}; expected {occid.OCCID_SCHEMA_VERSION}"
+        )
+
+    model_id = int(payload[OCCID_MODEL_ID_KEY])
     model_type = occid.OCCID_MODEL_BY_ID.get(model_id)
     if model_type is None:
         raise ValueError(f"unknown OCCID model id {model_id}")
-    return model_type.decode(encoded)
+
+    model_name = str(payload[OCCID_MODEL_KEY])
+    if model_name != model_type.__name__:
+        raise ValueError(
+            f"OCCID model name/id mismatch name={model_name} id={model_id} "
+            f"expected={model_type.__name__}"
+        )
+
+    fields = {
+        key: _bus_to_wire(value)
+        for key, value in payload.items()
+        if key not in OCCID_META_KEYS
+    }
+    return model_type, fields
+
+
+def _bus_to_wire(value: Any) -> Any:
+    if type(value) == dict:
+        if set(value) == {OCCID_BYTES_KEY}:
+            return base64.b64decode(value[OCCID_BYTES_KEY], validate=True)
+        if OCCID_META_KEYS.issubset(value):
+            model_type, fields = _bus_model_to_wire(value)
+            return {
+                "model_id": occid.OCCID_MODEL_ID_BY_CLASS[model_type],
+                "fields": fields,
+            }
+        return {key: _bus_to_wire(item) for key, item in value.items()}
+    if type(value) == list:
+        return [_bus_to_wire(item) for item in value]
+    return value
+
+
+def unpack_occid(payload: Any) -> Any:
+    """Validate and reconstruct an OCCID model from its readable bus form."""
+    if type(payload) is not dict:
+        raise ValueError(f"invalid OCCID bus payload type={type(payload).__name__}")
+    model_type, fields = _bus_model_to_wire(payload)
+    return model_type._from_wire_fields(fields)
 
 
 def get_occid_state(state: dict[str, Any], key: str, expected_type: type | tuple[type, ...] | None = None) -> Any:
