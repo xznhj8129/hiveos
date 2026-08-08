@@ -105,7 +105,7 @@ class MavsdkInterface(PluginBase):
             roll=float(initial.get("roll", initial.get("Roll", 0.0))),
             pitch=float(initial.get("pitch", initial.get("Pitch", 0.0))),
             yaw=float(initial.get("yaw", initial.get("Yaw", 0.0))),
-            throttle=float(initial.get("throttle", initial.get("Throttle", 0.0))),
+            throttle=float(initial.get("throttle", initial.get("Throttle", -1.0))),
             aux=[float(value) for value in initial.get("aux", initial.get("Aux", []))],
         )
         self.control_override: Any | None = None
@@ -133,6 +133,14 @@ class MavsdkInterface(PluginBase):
         if self.control_override is None:
             return False
         return time.monotonic() - self.control_override_updated_at <= float(self.control_override_timeout_s)
+
+    @staticmethod
+    def _mavsdk_manual_throttle(value: float) -> float:
+        """Map OCCID signed control position [-1, 1] to MAVSDK throttle [0, 1]."""
+        signed = float(value)
+        if signed < -1.0 or signed > 1.0:
+            raise ValueError(f"OCCID throttle {signed} outside [-1, 1]")
+        return (signed + 1.0) / 2.0
 
     def _merge_override(self, override: Any) -> Any:
         update: dict[str, Any] = {}
@@ -448,10 +456,10 @@ class MavsdkInterface(PluginBase):
                 output = self.control_output
                 override = self.control_override
             await self.drone.manual_control.set_manual_control_input(
-                float(output.pitch or 0.0),
-                float(output.roll or 0.0),
-                float(output.throttle or 0.0),
-                float(output.yaw or 0.0),
+                float(output.pitch),
+                float(output.roll),
+                self._mavsdk_manual_throttle(float(output.throttle)),
+                float(output.yaw),
             )
             if not self.manual_control_started:
                 await self.drone.manual_control.start_altitude_control()

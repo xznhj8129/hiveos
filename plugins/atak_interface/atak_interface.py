@@ -21,6 +21,9 @@ from lib.state_scheduler import StateScheduler
 from interop.cot import CotPointFields, cot_point_to_location_state, global_position_to_cot_point, location_state_to_cot_point
 
 
+COT_SUBJECT_PREFIX = "external:cot:"
+
+
 @dataclass(frozen=True)
 class Endpoint:
     host: str
@@ -307,12 +310,23 @@ class AtakInterface(PluginBase):
 
     def _record_id(self, uid: str, timestamp: float) -> Any:
         return occid.StringID(
-            id_type=occid.IdentifierType.TRACK_ID,
-            value=f"cot:{uid}:{int(timestamp * 1000)}",
+            id_type=occid.IdentifierType.DB_ID,
+            value=f"record:cot:{uid}:{int(timestamp * 1000)}",
         )
 
     def _subject_id(self, uid: str) -> Any:
-        return occid.StringID(id_type=occid.IdentifierType.TRACK_ID, value=str(uid))
+        """Create a local OCCID identity for an unresolved external CoT identity."""
+        return occid.StringID(
+            id_type=occid.IdentifierType.DB_ID,
+            value=f"{COT_SUBJECT_PREFIX}{uid}",
+        )
+
+    def _cot_uid_for_subject(self, subject_id: Any) -> str:
+        """Map an OCCID subject to a CoT UID without treating the IDs as aliases."""
+        value = str(subject_id.value)
+        if subject_id.id_type == occid.IdentifierType.DB_ID and value.startswith(COT_SUBJECT_PREFIX):
+            return value[len(COT_SUBJECT_PREFIX):]
+        return f"occid:{subject_id.id_type.name}:{value}"
 
     def _event_to_entity_state(self, event: Any, source: tuple[str, int]) -> Any:
         uid = str(event.unique_id)
@@ -331,7 +345,7 @@ class AtakInterface(PluginBase):
                 created_ts=timestamp,
                 updated_ts=timestamp,
                 origin_system="CoT",
-                provenance=[f"{source[0]}:{source[1]}", str(event.event_type)],
+                provenance=[f"{source[0]}:{source[1]}", str(event.event_type), f"cot_uid:{uid}"],
             ),
             subject_id=self._subject_id(uid),
             timestamp=timestamp,
@@ -382,7 +396,7 @@ class AtakInterface(PluginBase):
         if state.position is None:
             raise ValueError("EntityState requires position for CoT marker translation")
         point = location_state_to_cot_point(state.position)
-        uid = str(state.subject_id.value)
+        uid = self._cot_uid_for_subject(state.subject_id)
         return self.translator.marker_xml(
             callsign=uid,
             uid=uid,

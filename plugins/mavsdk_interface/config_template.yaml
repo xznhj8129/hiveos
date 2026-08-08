@@ -21,11 +21,13 @@ cfg:
   consume_control_override: false
   control_override_timeout_s: 0.3
   control_override_send_interval_s: 0.05
+  # OCCID control axes are signed [-1, 1]. The MAVSDK adapter maps signed
+  # throttle to MAVSDK's unidirectional [0, 1] manual-control throttle.
   control_output_initial:
     roll: 0.0
     pitch: 0.0
     yaw: 0.0
-    throttle: 0.0
+    throttle: -1.0
     aux: []
 
   # Local routing/rate-control stream names. Payload semantics come from OCCID models.
