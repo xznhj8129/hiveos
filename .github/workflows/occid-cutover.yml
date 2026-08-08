@@ -37,7 +37,9 @@ jobs:
           OCCID_PATH: ${{ github.workspace }}/occid-sdk
         run: |
           python - <<'PY'
-          from lib.occid_bus import occid
+          import json
+
+          from lib.occid_bus import occid, pack_occid, unpack_occid
           from interop.common import normalized_to_pwm, pwm_to_normalized
           from interop.mavsdk import standard_mode_from_native_name
           from interop.msp import standard_mode_from_native_names
@@ -48,6 +50,25 @@ jobs:
           assert normalized_to_pwm(1.0, 1000, 2000) == 2000
           assert standard_mode_from_native_name('OFFBOARD') == occid.StandardFlightMode.EXTERNAL_CONTROL
           assert standard_mode_from_native_names(['NAV_RTH']) == occid.StandardFlightMode.SAFE_RECOVERY
+
+          position = occid.GlobalPosition(
+              lat=45.5017,
+              lon=-73.5673,
+              alt=37.2,
+              alt_frame=occid.AltitudeDatum.SEA_LEVEL,
+          )
+          location = occid.LocationState(
+              inertial_frame=occid.InertialReferenceFrame.NED,
+              position=position,
+          )
+          readable = pack_occid(location)
+          assert readable['_occid_model'] == 'LocationState'
+          assert readable['inertial_frame'] == 'NED'
+          assert readable['position']['_occid_model'] == 'GlobalPosition'
+          assert readable['position']['alt_frame'] == 'SEA_LEVEL'
+          assert 'occid_b64' not in readable
+          json.dumps(readable)
+          assert unpack_occid(readable) == location
           PY
 
       - name: Reject legacy semantic namespace imports
