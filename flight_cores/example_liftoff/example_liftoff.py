@@ -1,62 +1,42 @@
 #!/usr/bin/env python3
-"""
-Usage:
-    from flight_cores.example_liftoff.example_liftoff import run_core
-    run_core(cfg, bus_config)
-"""
+"""OCCID telemetry snapshot program for the Liftoff simulator backend."""
+
+from __future__ import annotations
 
 import time
 from typing import Any, Dict
 
-from lib.common import apply_cfg, build_state_topics, build_topic_base
+from lib.common import apply_cfg
 from lib.core_base import CoreBase
-from protocols.namespace_loader import load_protocol_namespace
-
-UAV = load_protocol_namespace("uav")
+from lib.occid_bus import occid
+from lib.occid_topics import ATTITUDE, FLIGHT_CONTROL, LOCATION, POWER, RC_TELEMETRY
+from lib.uav_client import UavClient
 
 
 class ExampleLiftoffCore(CoreBase):
     def __init__(self, cfg: Dict[str, Any], bus_config: Dict[str, Any]) -> None:
         super().__init__(cfg, bus_config)
         apply_cfg(self, cfg)
-        interface_cfg = cfg["interface"]
-        base = build_topic_base(interface_cfg["id"], interface_cfg["topic_ns"])
-        self.state_keys = [
-            UAV.State.System.FcConnected,
-            UAV.State.Sensor.SensorConfig,
-            UAV.State.System.FlightMode,
-            UAV.State.Flight.IsInAir,
-            UAV.State.Navigation.AltitudeM,
-            UAV.State.Attitude.AttitudeRad,
-            UAV.State.Control.RcTelemetry,
-            UAV.State.Power.Battery,
-            UAV.State.Power.Analog,
-        ]
-        state_topics = build_state_topics(base, self.state_keys)
-        self.init_bus(float(self.poll_interval_s), state_topics)
+        self.uav = UavClient(self, cfg["interface"], float(self.response_timeout_s))
+        self.state_keys = [FLIGHT_CONTROL, LOCATION, ATTITUDE, RC_TELEMETRY, POWER]
+        self.init_bus(float(self.poll_interval_s), self.uav.state_topics(self.state_keys), self.uav.response_topic)
 
-    def _print_snapshot(self) -> None:  # Print one structured telemetry snapshot.
-        snapshot = self.state
-        print("\n=== Liftoff Snapshot ===", flush=True)
-        print(f"FcConnected: {snapshot.get(UAV.State.System.FcConnected)}", flush=True)
-        print(f"SensorConfig: {snapshot.get(UAV.State.Sensor.SensorConfig)}", flush=True)
-        print(f"FlightMode: {snapshot.get(UAV.State.System.FlightMode)}", flush=True)
-        print(f"IsInAir: {snapshot.get(UAV.State.Flight.IsInAir)}", flush=True)
-        print(f"AltitudeM: {snapshot.get(UAV.State.Navigation.AltitudeM)}", flush=True)
-        print(f"AttitudeRad: {snapshot.get(UAV.State.Attitude.AttitudeRad)}", flush=True)
-        print(f"RcTelemetry: {snapshot.get(UAV.State.Control.RcTelemetry)}", flush=True)
-        print(f"Battery: {snapshot.get(UAV.State.Power.Battery)}", flush=True)
-        print(f"Analog: {snapshot.get(UAV.State.Power.Analog)}", flush=True)
+    def _print_snapshot(self) -> None:
+        print("\n=== Liftoff/OCCID Snapshot ===", flush=True)
+        print(f"flight_control: {self.uav.state(FLIGHT_CONTROL, occid.FlightControlState)}", flush=True)
+        print(f"location: {self.uav.state(LOCATION, occid.LocationState)}", flush=True)
+        print(f"attitude: {self.uav.state(ATTITUDE, occid.EulerAngles)}", flush=True)
+        print(f"rc_telemetry: {self.uav.state(RC_TELEMETRY, occid.ControlAxisSet)}", flush=True)
+        print(f"power: {self.uav.state(POWER, occid.ElectricalResourceState)}", flush=True)
 
     def run(self) -> None:
         self.send_online()
-        self.wait_for_state(
-            UAV.State.System.FcConnected,
+        self.wait_until(
+            lambda: self.uav.flight_control() is not None,
             float(self.state_timeout_s),
-            RuntimeError("liftoff fc connection timeout"),
-            lambda value: bool(value),
+            RuntimeError("Liftoff OCCID state timeout"),
         )
-        print(f"[CORE] {self.client_id} fc_connected=True", flush=True)
+        print(f"[CORE] {self.client_id} liftoff_uav_state_online=True", flush=True)
         last_print = 0.0
         try:
             while True:

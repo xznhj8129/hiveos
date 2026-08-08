@@ -1,12 +1,8 @@
 #!/usr/bin/env python3
-"""
-ATAK interface plugin that bridges CoT traffic to HiveOS bus topics.
-Usage:
-    from plugins.atak_interface.atak_interface import run_plugin
-    run_plugin(cfg, bus_config)
-"""
+"""CoT/ATAK endpoint adapter: OCCID <-> Cursor on Target."""
 
-import datetime
+from __future__ import annotations
+
 import select
 import socket
 import struct
@@ -17,19 +13,12 @@ from typing import Any, Dict, Iterable
 
 import frogcot
 
-from lib.common import (
-    apply_cfg,
-    build_event_topics,
-    build_request_topic,
-    build_response_topic,
-    build_state_scheduler_topics,
-    build_topic_base,
-)
+from lib.common import apply_cfg, build_envelope, build_request_topic, build_response_topic, build_state_scheduler_topics, build_topic_base
+from lib.occid_bus import decode_occid_request, occid, pack_occid
+from lib.occid_topics import COT_RAW, ENTITY_STATE
 from lib.plugin_base import PluginBase
 from lib.state_scheduler import StateScheduler
-from protocols.namespace_loader import load_protocol_namespace
-
-ATAK = load_protocol_namespace("atak")
+from interop.cot import CotPointFields, cot_point_to_location_state, global_position_to_cot_point, location_state_to_cot_point
 
 
 @dataclass(frozen=True)
@@ -194,109 +183,56 @@ class TcpClientReceiver:
 
 
 class CotTranslator:
-    def __init__(self, stale_seconds: int, default_ce: float, default_le: float, self_callsign: str, self_cottype: str) -> None:
-        self.stale_seconds = stale_seconds
-        self.default_ce = default_ce
-        self.default_le = default_le
-        self.client = frogcot.ATAKClient(self_callsign, cottype=self_cottype, is_self=True)
+    def __init__(
+        self,
+        stale_seconds: int,
+        default_ce: float,
+        default_le: float,
+        self_callsign: str,
+        self_cottype: str,
+    ) -> None:
+        self.stale_seconds = int(stale_seconds)
+        self.default_ce = float(default_ce)
+        self.default_le = float(default_le)
+        self.self_callsign = str(self_callsign)
+        self.self_cottype = str(self_cottype)
+        self.client = frogcot.ATAKClient(self.self_callsign, cottype=self.self_cottype, is_self=True)
 
     def parse_event(self, xml_text: str) -> frogcot.Event:
         return frogcot.xml_to_cot(xml_text)
 
-    def marker_xml(self, callsign: str, uid: str, cottype: str, position: Dict[str, Any], stale_seconds: int | None) -> bytes:
-        stale = self.stale_seconds if stale_seconds is None else stale_seconds
+    def marker_xml(self, callsign: str, uid: str, cottype: str, point: CotPointFields) -> bytes:
         payload = {
-            "lat": float(position["LatDeg"]),
-            "lon": float(position["LonDeg"]),
-            "alt": float(position["AltM"]),
-            "ce": float(position["Ce"]),
-            "le": float(position["Le"]),
+            "lat": float(point.lat_deg),
+            "lon": float(point.lon_deg),
+            "alt": float(point.hae_m),
+            "ce": self.default_ce if point.ce_m is None else float(point.ce_m),
+            "le": self.default_le if point.le_m is None else float(point.le_m),
         }
-        return self.client.cot_marker(callsign, uid, cottype, payload, staletime=stale)
+        return self.client.cot_marker(
+            str(callsign),
+            str(uid),
+            str(cottype),
+            payload,
+            staletime=self.stale_seconds,
+        )
 
-    def geochat_xml(self, message: str, to_team: str, position: Dict[str, Any]) -> bytes:
+    def geochat_xml(self, message: str, to_team: str, point: CotPointFields) -> bytes:
         payload = {
-            "lat": float(position["LatDeg"]),
-            "lon": float(position["LonDeg"]),
-            "alt": float(position["AltM"]),
-            "ce": float(position["Ce"]),
-            "le": float(position["Le"]),
+            "lat": float(point.lat_deg),
+            "lon": float(point.lon_deg),
+            "alt": float(point.hae_m),
+            "ce": self.default_ce if point.ce_m is None else float(point.ce_m),
+            "le": self.default_le if point.le_m is None else float(point.le_m),
         }
-        xml_bytes = self.client.geochat(message, to_team=to_team, pos=payload)
+        xml_bytes = self.client.geochat(str(message), to_team=str(to_team), pos=payload)
         if xml_bytes is None:
             raise RuntimeError("geochat generation failed")
         return xml_bytes
 
-    def marker_event_json(
-        self, callsign: str, uid: str, cottype: str, position: Dict[str, Any], stale_seconds: int | None
-    ) -> Dict[str, Any]:
-        stale = self.stale_seconds if stale_seconds is None else stale_seconds
-        now = datetime.datetime.now(datetime.timezone.utc)
-        stale_time = now + datetime.timedelta(seconds=stale)
-        event = frogcot.Event(
-            point=frogcot.Point(
-                latitude=float(position["LatDeg"]),
-                longitude=float(position["LonDeg"]),
-                height_above_ellipsoid=float(position["AltM"]),
-                circular_error=float(position["Ce"]),
-                linear_error=float(position["Le"]),
-            ),
-            detail={"contact": {"callsign": callsign}},
-            version=2,
-            event_type=cottype,
-            unique_id=uid,
-            time=now,
-            start=now,
-            stale=stale_time,
-            how="h-g-i-g-o",
-        )
-        return event.to_dict()
-
-    def event_json_to_xml(self, event_data: Dict[str, Any]) -> bytes:
-        if "point" in event_data and "event_type" in event_data:
-            event = frogcot.Event.from_dict(dict(event_data))
-            return frogcot.cot_to_xml(event).encode("utf-8")
-
-        now = datetime.datetime.now(datetime.timezone.utc)
-        stale = now + datetime.timedelta(seconds=self.stale_seconds)
-        if "Time" in event_data:
-            now = datetime.datetime.fromisoformat(str(event_data["Time"]).replace("Z", "+00:00"))
-        start = now
-        if "Start" in event_data:
-            start = datetime.datetime.fromisoformat(str(event_data["Start"]).replace("Z", "+00:00"))
-        if "Stale" in event_data:
-            stale = datetime.datetime.fromisoformat(str(event_data["Stale"]).replace("Z", "+00:00"))
-        point_data = event_data["Position"]
-        detail = event_data.get("Detail")
-        if detail is not None:
-            detail = dict(detail)
-        if event_data.get("Callsign") and detail is None:
-            detail = {"contact": {"callsign": event_data["Callsign"]}}
-
-        event = frogcot.Event(
-            point=frogcot.Point(
-                latitude=float(point_data["LatDeg"]),
-                longitude=float(point_data["LonDeg"]),
-                height_above_ellipsoid=float(point_data.get("HaeM", point_data.get("AltM", 0.0))),
-                circular_error=float(point_data.get("Ce", self.default_ce)),
-                linear_error=float(point_data.get("Le", self.default_le)),
-            ),
-            detail=detail,
-            version=int(event_data.get("Version", 2)),
-            event_type=str(event_data["Type"]),
-            access=event_data.get("Access"),
-            quality_of_service=event_data.get("Qos"),
-            unique_id=str(event_data["Uid"]),
-            time=now,
-            start=start,
-            stale=stale,
-            how=str(event_data.get("How", "m-g")),
-        )
-        return frogcot.cot_to_xml(event).encode("utf-8")
-
 
 class AtakInterface(PluginBase):
-    def __init__(self, cfg: Dict[str, Any], bus_config: Dict[str, Any]) -> None:  # Initialize ATAK bridge plugin.
+    def __init__(self, cfg: Dict[str, Any], bus_config: Dict[str, Any]) -> None:
         super().__init__(cfg, bus_config)
         apply_cfg(self, cfg)
 
@@ -305,15 +241,6 @@ class AtakInterface(PluginBase):
             self.client,
             self.client_id,
             build_state_scheduler_topics(base, self.state_intervals),
-        )
-        self.event_topics = build_event_topics(
-            base,
-            [
-                ATAK.Event.Cot.ReceivedEvent,
-                ATAK.Event.Marker.ReceivedMarker,
-                ATAK.Event.GeoChat.ReceivedGeoChat,
-                ATAK.Event.System.ParseError,
-            ],
         )
         self.request_topic = build_request_topic(self.client_id, self.topic_ns)
         self.response_topic = build_response_topic(self.client_id, self.topic_ns)
@@ -329,16 +256,18 @@ class AtakInterface(PluginBase):
 
         tcp_listen_cfg = cfg["tcp_listen"]
         if bool(tcp_listen_cfg["enabled"]):
-            tcp_listen_endpoint = Endpoint(tcp_listen_cfg["host"], int(tcp_listen_cfg["port"]))
-            self.tcp_listener: TcpListener | None = TcpListener(tcp_listen_endpoint, self.recv_buffer_bytes)
+            endpoint = Endpoint(tcp_listen_cfg["host"], int(tcp_listen_cfg["port"]))
+            self.tcp_listener: TcpListener | None = TcpListener(endpoint, self.recv_buffer_bytes)
         else:
             self.tcp_listener = None
 
         tcp_connect_cfg = cfg["tcp_connect"]
         if bool(tcp_connect_cfg["enabled"]):
-            tcp_connect_endpoint = Endpoint(tcp_connect_cfg["host"], int(tcp_connect_cfg["port"]))
+            endpoint = Endpoint(tcp_connect_cfg["host"], int(tcp_connect_cfg["port"]))
             self.tcp_client: TcpClientReceiver | None = TcpClientReceiver(
-                tcp_connect_endpoint, self.recv_buffer_bytes, float(tcp_connect_cfg["reconnect_secs"])
+                endpoint,
+                self.recv_buffer_bytes,
+                float(tcp_connect_cfg["reconnect_secs"]),
             )
         else:
             self.tcp_client = None
@@ -356,204 +285,141 @@ class AtakInterface(PluginBase):
         self.rx_count = 0
         self.tx_count = 0
         self.rx_parse_errors = 0
-        self.last_error = ""
-        self.last_rx_event: Dict[str, Any] = {}
-        self.last_tx_event: Dict[str, Any] = {}
-        self.last_tx_result: Dict[str, Any] = {}
         self.tcp_client_connected: bool | None = None
 
-    def _parse_targets(self, raw_targets: list[Dict[str, Any]]) -> list[Endpoint]:  # Parse list of send targets.
-        targets: list[Endpoint] = []
-        for entry in raw_targets:
-            targets.append(Endpoint(entry["host"], int(entry["port"])))
-        return targets
+    def _parse_targets(self, raw_targets: list[Dict[str, Any]]) -> list[Endpoint]:
+        return [Endpoint(entry["host"], int(entry["port"])) for entry in raw_targets]
 
-    def _update_state(self, key: str, value: Any) -> None:  # Update state only when field is configured.
-        if key not in self.state_scheduler.topics:
-            return
-        self.state_scheduler.update(key, value)
+    def _publish_model(self, key: str, model: Any) -> None:
+        if key in self.state_scheduler.topics:
+            self.state_scheduler.update(key, pack_occid(model))
+
+    def _publish_diag(self, name: str, data: Dict[str, Any]) -> None:
+        topic = f"DIAG/{self.client_id}/{name}"
+        self.client.publish(topic, build_envelope(self.client_id, topic, data))
 
     def _sync_tcp_client_connected(self) -> None:
         connected = self.tcp_client is not None and self.tcp_client.socket() is not None
         if connected == self.tcp_client_connected:
             return
         self.tcp_client_connected = connected
-        self._update_state(ATAK.State.Link.TcpClientConnected, connected)
+        print(f"[PLUGIN] {self.client_id} tcp_client_connected={connected}", flush=True)
 
-    def _handle_inbound(self, payload: bytes, source: tuple[str, int]) -> None:  # Parse inbound CoT and update state.
+    def _record_id(self, uid: str, timestamp: float) -> Any:
+        return occid.StringID(
+            id_type=occid.IdentifierType.TRACK_ID,
+            value=f"cot:{uid}:{int(timestamp * 1000)}",
+        )
+
+    def _subject_id(self, uid: str) -> Any:
+        return occid.StringID(id_type=occid.IdentifierType.TRACK_ID, value=str(uid))
+
+    def _event_to_entity_state(self, event: Any, source: tuple[str, int]) -> Any:
+        uid = str(event.unique_id)
+        timestamp = event.time.timestamp() if event.time is not None else time.time()
+        point = CotPointFields(
+            lat_deg=float(event.point.latitude),
+            lon_deg=float(event.point.longitude),
+            hae_m=float(event.point.height_above_ellipsoid),
+            ce_m=None if event.point.circular_error is None else float(event.point.circular_error),
+            le_m=None if event.point.linear_error is None else float(event.point.linear_error),
+        )
+        location = cot_point_to_location_state(point)
+        return occid.EntityState(
+            record=occid.RecordMeta(
+                record_id=self._record_id(uid, timestamp),
+                created_ts=timestamp,
+                updated_ts=timestamp,
+                origin_system="CoT",
+                provenance=[f"{source[0]}:{source[1]}", str(event.event_type)],
+            ),
+            subject_id=self._subject_id(uid),
+            timestamp=timestamp,
+            position=location,
+            links={},
+        )
+
+    def _handle_inbound(self, payload: bytes, source: tuple[str, int]) -> None:
         try:
             xml_text = payload.decode("utf-8").strip()
             if not xml_text:
                 return
+            self._publish_model(
+                COT_RAW,
+                occid.ProtocolPayload(
+                    format=occid.ProtocolPayloadFormat.XML,
+                    content_type="application/cot+xml",
+                    text=xml_text,
+                ),
+            )
             event = self.translator.parse_event(xml_text)
-            callsign = None
-            if event.detail and "contact" in event.detail:
-                contact = event.detail["contact"]
-                callsign = contact.get("@callsign") or contact.get("callsign")
-            summary = {
-                "Uid": event.unique_id,
-                "Type": event.event_type,
-                "How": event.how,
-                "Time": event.time.isoformat(),
-                "Start": event.start.isoformat(),
-                "Stale": event.stale.isoformat(),
-                "PositionLatDeg": event.point.latitude,
-                "PositionLonDeg": event.point.longitude,
-                "PositionHaeM": event.point.height_above_ellipsoid,
-                "PositionCe": event.point.circular_error,
-                "PositionLe": event.point.linear_error,
-                "SourceHost": source[0],
-                "SourcePort": source[1],
-            }
-            if callsign:
-                summary["Callsign"] = callsign
-            if event.detail is not None:
-                summary["DetailXml"] = str(event.detail)
+            entity_state = self._event_to_entity_state(event, source)
+            self._publish_model(ENTITY_STATE, entity_state)
             self.rx_count += 1
-            self.last_rx_event = summary
-            self._update_state(ATAK.State.Rx.LastEvent, self.last_rx_event)
-            self._publish_event(ATAK.Event.Cot.ReceivedEvent, self.last_rx_event)
-            if str(event.event_type).startswith("a-"):
-                marker_event = {
-                    "Uid": event.unique_id,
-                    "CotType": event.event_type,
-                    "PositionLatDeg": event.point.latitude,
-                    "PositionLonDeg": event.point.longitude,
-                    "PositionHaeM": event.point.height_above_ellipsoid,
-                    "PositionCe": event.point.circular_error,
-                    "PositionLe": event.point.linear_error,
-                }
-                if callsign:
-                    marker_event["Callsign"] = callsign
-                self._publish_event(ATAK.Event.Marker.ReceivedMarker, marker_event)
-            if event.event_type == "b-t-f":
-                geochat_event = {"Uid": event.unique_id, "Message": ""}
-                if callsign:
-                    geochat_event["FromCallsign"] = callsign
-                self._publish_event(ATAK.Event.GeoChat.ReceivedGeoChat, geochat_event)
-            self._update_state(ATAK.State.System.RxCount, self.rx_count)
             print(
-                f"[PLUGIN] {self.client_id} rx uid={summary['Uid']} type={summary['Type']} source={source[0]}:{source[1]}",
+                f"[PLUGIN] {self.client_id} rx uid={event.unique_id} type={event.event_type} "
+                f"source={source[0]}:{source[1]} rx_count={self.rx_count}",
                 flush=True,
             )
-        except (UnicodeDecodeError, ValueError, KeyError, TypeError) as exc:
+        except (UnicodeDecodeError, ValueError, KeyError, TypeError, AttributeError) as exc:
             self.rx_parse_errors += 1
-            self.last_error = f"{exc.__class__.__name__}: {exc}"
-            self._update_state(ATAK.State.System.RxParseErrors, self.rx_parse_errors)
-            self._update_state(ATAK.State.System.LastError, self.last_error)
-            self._publish_event(ATAK.Event.System.ParseError, {"Error": self.last_error})
+            error = f"{exc.__class__.__name__}: {exc}"
+            self._publish_diag(
+                "RX_PARSE_ERROR",
+                {"error": error, "count": self.rx_parse_errors},
+            )
             print(
-                f"[PLUGIN] {self.client_id} rx_parse_errors={self.rx_parse_errors} last_error={self.last_error}",
+                f"[PLUGIN] {self.client_id} rx_parse_errors={self.rx_parse_errors} last_error={error}",
                 flush=True,
             )
 
-    def _send_xml(self, xml_bytes: bytes, targets: list[Endpoint], tx_event: Dict[str, Any]) -> Dict[str, Any]:  # Send CoT payload.
+    def _send_xml(self, xml_bytes: bytes, targets: list[Endpoint]) -> Dict[str, Any]:
         self.sender.send(xml_bytes, targets)
         self.tx_count += 1
-        self.last_tx_event = tx_event
-        self.last_tx_result = {"TargetCount": len(targets), "Bytes": len(xml_bytes)}
-        self._update_state(ATAK.State.Tx.LastResult, self.last_tx_result)
-        self._update_state(ATAK.State.System.TxCount, self.tx_count)
-        return self.last_tx_result
+        return {"target_count": len(targets), "bytes_sent": len(xml_bytes), "tx_count": self.tx_count}
 
-    def _handle_request(self, request: Dict[str, Any]) -> None:  # Handle bus REQUEST action.
-        request_id = str(request["request_id"])
-        action = request["action"]
-        params = request.get("params") or {}
+    def _entity_state_xml(self, state: Any) -> bytes:
+        if state.position is None:
+            raise ValueError("EntityState requires position for CoT marker translation")
+        point = location_state_to_cot_point(state.position)
+        uid = str(state.subject_id.value)
+        return self.translator.marker_xml(
+            callsign=uid,
+            uid=uid,
+            cottype=self.translator.self_cottype,
+            point=point,
+        )
 
-        if action == ATAK.Action.Cot.SendEvent:
-            event_data = {
-                "Uid": str(params["Uid"]),
-                "Type": str(params["Type"]),
-                "How": str(params["How"]),
-                "Position": {
-                    "LatDeg": float(params["PositionLatDeg"]),
-                    "LonDeg": float(params["PositionLonDeg"]),
-                    "HaeM": float(params["PositionHaeM"]),
-                    "Ce": float(params["PositionCe"]),
-                    "Le": float(params["PositionLe"]),
-                },
-            }
-            if "Time" in params:
-                event_data["Time"] = str(params["Time"])
-            if "Start" in params:
-                event_data["Start"] = str(params["Start"])
-            if "Stale" in params:
-                event_data["Stale"] = str(params["Stale"])
-            if "Callsign" in params:
-                event_data["Callsign"] = str(params["Callsign"])
-            targets = self.cot_output_targets
-            if "Targets" in params:
-                targets = self._parse_targets(params["Targets"])
-            xml_bytes = self.translator.event_json_to_xml(event_data)
-            result = self._send_xml(xml_bytes, targets, event_data)
-            self.enqueue_response(request_id, action, True, result)
-            return
+    def _human_text_xml(self, message: Any) -> bytes:
+        if message.position is None:
+            raise ValueError("HumanTextMessage requires position for ATAK geochat translation")
+        point = global_position_to_cot_point(message.position)
+        destination = message.destination_group
+        if destination is None and message.destination_id is not None:
+            destination = message.destination_id.value
+        if destination is None:
+            destination = message.dst.target_id.value
+        return self.translator.geochat_xml(message.message, str(destination), point)
 
-        if action == ATAK.Action.Marker.SendMarker:
-            stale_seconds = None
-            if "StaleSeconds" in params:
-                stale_seconds = int(params["StaleSeconds"])
-            position = {
-                "LatDeg": float(params["PositionLatDeg"]),
-                "LonDeg": float(params["PositionLonDeg"]),
-                "AltM": float(params["PositionAltM"]),
-                "Ce": float(params["PositionCe"]),
-                "Le": float(params["PositionLe"]),
-            }
-            marker_event = self.translator.marker_event_json(
-                callsign=str(params["Callsign"]),
-                uid=str(params["Uid"]),
-                cottype=str(params["CotType"]),
-                position=position,
-                stale_seconds=stale_seconds,
-            )
-            xml_bytes = self.translator.marker_xml(
-                callsign=str(params["Callsign"]),
-                uid=str(params["Uid"]),
-                cottype=str(params["CotType"]),
-                position=position,
-                stale_seconds=stale_seconds,
-            )
-            targets = self.cot_output_targets
-            if "Targets" in params:
-                targets = self._parse_targets(params["Targets"])
-            result = self._send_xml(xml_bytes, targets, marker_event)
-            self.enqueue_response(request_id, action, True, result)
-            return
+    def _handle_request(self, request: Dict[str, Any]) -> None:
+        request_id, model = decode_occid_request(request)
+        try:
+            if isinstance(model, occid.EntityState):
+                xml_bytes = self._entity_state_xml(model)
+            elif isinstance(model, occid.HumanTextMessage):
+                xml_bytes = self._human_text_xml(model)
+            elif isinstance(model, occid.ProtocolPayload):
+                if model.format != occid.ProtocolPayloadFormat.XML or model.text is None:
+                    raise ValueError("CoT ProtocolPayload requires XML text")
+                xml_bytes = model.text.encode("utf-8")
+            else:
+                raise ValueError(f"unsupported OCCID model for CoT translation {type(model).__name__}")
+            result = self._send_xml(xml_bytes, self.cot_output_targets)
+            self.enqueue_response(request_id, type(model).__name__, True, result)
+        except (ValueError, TypeError, RuntimeError) as exc:
+            self.enqueue_response(request_id, type(model).__name__, False, {"error": str(exc)})
 
-        if action == ATAK.Action.GeoChat.SendGeoChat:
-            message = str(params["Message"])
-            to_team = str(params["ToTeam"])
-            position = {
-                "LatDeg": float(params["PositionLatDeg"]),
-                "LonDeg": float(params["PositionLonDeg"]),
-                "AltM": float(params["PositionAltM"]),
-                "Ce": float(params["PositionCe"]),
-                "Le": float(params["PositionLe"]),
-            }
-            geochat_event = {
-                "Type": "b-t-f",
-                "How": "m-g",
-                "Message": message,
-                "ToTeam": to_team,
-                "PositionLatDeg": position["LatDeg"],
-                "PositionLonDeg": position["LonDeg"],
-                "PositionHaeM": position["AltM"],
-                "PositionCe": position["Ce"],
-                "PositionLe": position["Le"],
-            }
-            xml_bytes = self.translator.geochat_xml(message, to_team, position)
-            targets = self.cot_output_targets
-            if "Targets" in params:
-                targets = self._parse_targets(params["Targets"])
-            result = self._send_xml(xml_bytes, targets, geochat_event)
-            self.enqueue_response(request_id, action, True, result)
-            return
-
-        self.enqueue_response(request_id, action, False, {"error": f"unknown action {action}"})
-
-    def _poll_network(self, timeout_s: float) -> None:  # Poll UDP/TCP sockets for inbound CoT payloads.
+    def _poll_network(self, timeout_s: float) -> None:
         if self.tcp_client is not None:
             self.tcp_client.ensure_connected()
         self._sync_tcp_client_connected()
@@ -578,13 +444,11 @@ class AtakInterface(PluginBase):
                 self.tcp_listener.accept_ready()
                 continue
             if self.tcp_listener is not None and self.tcp_listener.owns(sock):
-                messages = self.tcp_listener.recv_ready(sock)
-                for payload, source in messages:
+                for payload, source in self.tcp_listener.recv_ready(sock):
                     self._handle_inbound(payload, source)
                 continue
             if self.tcp_client is not None and self.tcp_client.socket() is sock:
-                messages = self.tcp_client.recv_ready()
-                for payload, source in messages:
+                for payload, source in self.tcp_client.recv_ready():
                     self._handle_inbound(payload, source)
                 continue
             receiver = receiver_by_fileno[sock.fileno()]
@@ -592,13 +456,9 @@ class AtakInterface(PluginBase):
             self._handle_inbound(payload, source)
         self._sync_tcp_client_connected()
 
-    def run(self) -> None:  # Run ATAK interface loop.
+    def run(self) -> None:
         self.send_online()
         self._sync_tcp_client_connected()
-        self._update_state(ATAK.State.System.RxCount, self.rx_count)
-        self._update_state(ATAK.State.System.TxCount, self.tx_count)
-        self._update_state(ATAK.State.System.RxParseErrors, self.rx_parse_errors)
-        self._update_state(ATAK.State.System.LastError, self.last_error)
         try:
             while True:
                 self._poll_network(self.loop_interval_s)
@@ -610,6 +470,7 @@ class AtakInterface(PluginBase):
                         break
                     if topic == self.request_topic:
                         self._handle_request(payload["data"])
+                        self.flush_queue(self.response_queue, self.response_topic)
         except (KeyboardInterrupt, SystemExit):
             pass
         except RuntimeError:
@@ -618,7 +479,7 @@ class AtakInterface(PluginBase):
         finally:
             self.stop()
 
-    def stop(self) -> None:  # Close ATAK sockets and stop plugin.
+    def stop(self) -> None:
         for receiver in self.receivers:
             receiver.close()
         self.sender.close()
