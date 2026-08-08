@@ -68,7 +68,7 @@ OCCID is maintained separately in the `occid` repository. MPFC loads its generat
 1. `OCCID_PATH`, pointing at the OCCID repository root, or
 2. a sibling `occid/` checkout beside the MPFC repository.
 
-Transient MQTT payloads use OCCID's own versioned MsgPack `encode()` representation, base64-wrapped only because the MQTT client currently carries JSON envelopes. MPFC does not invent another durable object representation.
+Transient MQTT payloads render OCCID models directly as JSON-compatible fields, tagged with `_occid_model`, `_occid_model_id`, and `_occid_schema_version` so they remain typed and deterministic while still being readable in ordinary MQTT debugging tools. OCCID's versioned MsgPack `encode()` representation remains the compact binary representation for transports that actually need it.
 
 Representative state streams include:
 
@@ -89,7 +89,7 @@ entity_state
 cot_raw
 ```
 
-These strings are routing keys, not types. The model encoded inside the payload defines the semantics.
+These strings are routing keys, not types. The tagged OCCID model inside `data` defines the semantics.
 
 ## UAV path
 
@@ -143,14 +143,37 @@ Important current plugins:
 
 ## MQTT bus
 
-Every process is an MQTT peer. The outer envelope is runtime metadata:
+Every process is an MQTT peer. The outer envelope is runtime metadata, while `data` stays directly inspectable:
 
 ```json
 {
-  "client": "sender_id",
-  "topic": "runtime/topic",
+  "client": "mavsdk",
+  "topic": "uav1/STATE/location",
   "time": 1770835200000,
-  "data": {}
+  "data": {
+    "_occid_model": "LocationState",
+    "_occid_model_id": 206,
+    "_occid_schema_version": [3, 0, 0],
+    "inertial_frame": "NED",
+    "body_frame": null,
+    "position": {
+      "_occid_model": "GlobalPosition",
+      "_occid_model_id": 196,
+      "_occid_schema_version": [3, 0, 0],
+      "lat": 45.5017,
+      "lon": -73.5673,
+      "alt": 37.2,
+      "mgrs": null,
+      "datum": "WGS84",
+      "alt_frame": "SEA_LEVEL"
+    },
+    "uncertainty": null,
+    "attitude": null,
+    "altitude": null,
+    "velocity": null,
+    "navigation_validity": null,
+    "gnss": null
+  }
 }
 ```
 
