@@ -1,0 +1,53 @@
+my_name: uav1
+vehicle:
+  autopilot: AutopilotType.PX4
+  airframe: AirframeType.COPTER
+  telem_type: TelemetryType.MAVLINK
+core:
+  name: execution_host
+  cfg:
+    id: execution_host
+    poll_interval_s: 0.25
+bus_config:
+  schema_path: ../../config/bus_topics_schema.json
+  log_file: hivebus.log
+  endpoint:
+    type: mqtt
+    host: 127.0.0.1
+    port: 1883
+plugins:
+- plugin: execution_ingress
+  cfg:
+    id: execution_ingress
+    topic_ns: EXECUTION
+    executor_id:
+      id_type: DB_ID
+      value: mpfc:<my_name>
+    asset_id:
+      id_type: DB_ID
+      value: <my_name>
+- plugin: uav_controller
+  cfg:
+    id: uav_controller
+    topic_ns: UAV
+    poll_interval_s: 0.1
+    response_timeout_s: 20.0
+- plugin: mavsdk_interface
+  cfg:
+    id: mavsdk
+    topic_ns: UAV
+    is_interface: true
+    conn_type: udp
+    conn_str: udp://:14550
+    mav_dialect: PX4
+    mav_type: MAV_TYPE_QUADROTOR
+    mav_sysid: 1
+    mavsdk_log_debug: false
+    state_intervals:
+      flight_control: 0.1
+      location: 0.1
+      attitude: 0.1
+      angular_velocity: 0.1
+      gnss: 0.5
+      power: 0.5
+      firmware: 1.0

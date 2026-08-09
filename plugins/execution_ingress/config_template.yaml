@@ -1,0 +1,22 @@
+plugin: execution_ingress
+cfg:
+  id: execution_ingress
+  topic_ns: EXECUTION
+  poll_interval_s: 0.1
+  response_timeout_s: 20.0
+  state_timeout_s: 60.0
+  execution_timeout_s: 180.0
+  progress_interval_s: 1.0
+  arrival_radius_m: 3.0
+  arrival_altitude_tolerance_m: 2.0
+  executor_id:
+    id_type: DB_ID
+    value: mpfc:<my_name>
+  asset_id:
+    id_type: DB_ID
+    value: <my_name>
+  interface:
+    id: uav_controller
+    topic_ns: UAV
+  event_keys:
+  - execution
