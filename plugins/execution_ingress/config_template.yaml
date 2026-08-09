@@ -9,6 +9,11 @@ cfg:
   progress_interval_s: 1.0
   arrival_radius_m: 3.0
   arrival_altitude_tolerance_m: 2.0
+  auto_takeoff_for_move: false
+  takeoff_altitude_m: 10.0
+  takeoff_altitude_ok_fraction: 0.8
+  post_takeoff_wait_s: 1.0
+  report_cache_size: 128
   executor_id:
     id_type: DB_ID
     value: mpfc:<my_name>

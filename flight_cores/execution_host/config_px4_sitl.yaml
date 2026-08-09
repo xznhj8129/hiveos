@@ -1,13 +1,16 @@
 my_name: uav1
+
 vehicle:
   autopilot: AutopilotType.PX4
   airframe: AirframeType.COPTER
   telem_type: TelemetryType.MAVLINK
+
 core:
   name: execution_host
   cfg:
     id: execution_host
     poll_interval_s: 0.25
+
 bus_config:
   schema_path: ../../config/bus_topics_schema.json
   log_file: hivebus.log
@@ -15,32 +18,57 @@ bus_config:
     type: mqtt
     host: 127.0.0.1
     port: 1883
+
 plugins:
+- plugin: px4_sitl_gz_launcher
+  cfg:
+    id: px4_sitl
+    auto_start: true
+    px4:
+      # Override without editing this file by setting PX4_AUTOPILOT_PATH.
+      px4_dir: ../PX4-Autopilot
+      sitl_vehicle: gz_x500
+      airframe_vehicle: gz_x500
+      companion_mavlink_port: 14540
+      qgc_mavlink_port: 14550
+      qgc_mavlink_enabled: false
+      qgc_local_port: 18571
+      home_lat: 47.397742
+      home_lon: 8.545594
+      home_alt: 488
+      model_pose: ""
+    gazebo:
+      gz_world: default
+      gz_ip: 127.0.0.1
+      gz_gui: true
+      video_host_ip: 127.0.0.1
+      video_host_port: 5601
+
 - plugin: execution_ingress
   cfg:
     id: execution_ingress
     topic_ns: EXECUTION
-    # Generic external-vehicle hosts do not arm or take off implicitly.
-    auto_takeoff_for_move: false
+    auto_takeoff_for_move: true
     executor_id:
       id_type: DB_ID
       value: mpfc:<my_name>
     asset_id:
       id_type: DB_ID
       value: <my_name>
+
 - plugin: uav_controller
   cfg:
     id: uav_controller
     topic_ns: UAV
     poll_interval_s: 0.1
     response_timeout_s: 20.0
+
 - plugin: mavsdk_interface
   cfg:
     id: mavsdk
     topic_ns: UAV
     is_interface: true
     conn_type: udp
-    # PX4 SITL's companion/offboard endpoint. Port 14550 is reserved for QGC.
     conn_str: udp://:14540
     mav_dialect: PX4
     mav_type: MAV_TYPE_QUADROTOR

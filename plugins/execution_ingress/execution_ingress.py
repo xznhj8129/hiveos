@@ -35,6 +35,7 @@ from lib.uav_client import UavClient
 
 
 EXECUTE_ACTION = "EXECUTE_OCCID"
+QUERY_ACTION = "QUERY_EXECUTION"
 EVENT_KEY = "execution"
 EARTH_RADIUS_M = 6371008.8
 
@@ -66,6 +67,34 @@ def _distance_m(a: Any, b: Any) -> float:
         + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2.0) ** 2
     )
     return 2.0 * EARTH_RADIUS_M * math.asin(min(1.0, math.sqrt(hav)))
+
+
+def _altitude_for_datum(location: Any, datum: Any) -> float:
+    """Select an observed altitude carrying the requested vertical datum."""
+    altitude = location.altitude
+    if altitude is not None:
+        if datum == altitude.absolute_datum and altitude.absolute_m is not None:
+            return float(altitude.absolute_m)
+        if datum == altitude.relative_datum and altitude.relative_m is not None:
+            return float(altitude.relative_m)
+
+    position = location.position
+    if position is not None and position.alt_frame == datum:
+        return float(position.alt)
+    raise RuntimeError(
+        "LocationState has no altitude observation for destination datum "
+        f"{datum.name}"
+    )
+
+
+def _arrival_metrics(location: Any, destination: Any) -> tuple[float, float]:
+    """Return horizontal and datum-correct vertical arrival errors."""
+    if location.position is None:
+        raise RuntimeError("cannot evaluate arrival without LocationState.position")
+    horizontal_m = _distance_m(location.position, destination)
+    observed_altitude_m = _altitude_for_datum(location, destination.alt_frame)
+    altitude_error_m = abs(observed_altitude_m - float(destination.alt))
+    return horizontal_m, altitude_error_m
 
 
 @dataclass(frozen=True)
@@ -120,18 +149,43 @@ def decode_execution_bundle(params: Dict[str, Any]) -> ExecutionBundle:
             f"{_id_text(assignment.task_id)} != {_id_text(task.task_id)}"
         )
 
-    if assignment.plan_id is not None:
-        if plan is None:
-            raise ValueError("Assignment references a Plan but plan_b64 was not supplied")
-        if assignment.plan_id != plan.plan_id:
-            raise ValueError(
-                "Assignment.plan_id does not match supplied Plan: "
-                f"{_id_text(assignment.plan_id)} != {_id_text(plan.plan_id)}"
-            )
-        if task.task_id not in plan.task_ids:
-            raise ValueError("supplied Plan does not contain the assigned Task")
-    elif plan is not None:
-        raise ValueError("plan_b64 supplied for an Assignment with no plan_id")
+    if assignment.plan_id is None:
+        raise ValueError("Block 1 OCCID Native execution requires an approved Plan")
+    if plan is None:
+        raise ValueError("Assignment references a Plan but plan_b64 was not supplied")
+    if assignment.plan_id != plan.plan_id:
+        raise ValueError(
+            "Assignment.plan_id does not match supplied Plan: "
+            f"{_id_text(assignment.plan_id)} != {_id_text(plan.plan_id)}"
+        )
+    if plan.approval_state != occid.PlanApprovalState.APPROVED:
+        raise ValueError(
+            f"supplied Plan is not approved state={plan.approval_state.name}"
+        )
+    if task.task_id not in plan.task_ids:
+        raise ValueError("supplied Plan does not contain the assigned Task")
+
+    if assignment.status not in (
+        occid.AssignmentStatus.ASSIGNED,
+        occid.AssignmentStatus.ACCEPTED,
+        occid.AssignmentStatus.ACTIVE,
+    ):
+        raise ValueError(
+            f"supplied Assignment is not executable state={assignment.status.name}"
+        )
+    if task.status in (
+        occid.TaskStatus.COMPLETE,
+        occid.TaskStatus.FAILED,
+        occid.TaskStatus.CANCELLED,
+    ):
+        raise ValueError(f"supplied Task is terminal state={task.status.name}")
+    if execution.phase not in (
+        occid.ExecutionPhase.CREATED,
+        occid.ExecutionPhase.QUEUED,
+    ):
+        raise ValueError(
+            f"supplied Execution is not dispatchable phase={execution.phase.name}"
+        )
 
     if objective is not None:
         if plan is None:
@@ -161,6 +215,13 @@ class ExecutionIngress(PluginBase):
         self.progress_interval_s = float(cfg["progress_interval_s"])
         self.arrival_radius_m = float(cfg["arrival_radius_m"])
         self.arrival_altitude_tolerance_m = float(cfg["arrival_altitude_tolerance_m"])
+        self.auto_takeoff_for_move = bool(cfg["auto_takeoff_for_move"])
+        self.takeoff_altitude_m = float(cfg["takeoff_altitude_m"])
+        self.takeoff_altitude_ok_fraction = float(cfg["takeoff_altitude_ok_fraction"])
+        self.post_takeoff_wait_s = float(cfg["post_takeoff_wait_s"])
+        self.report_cache_size = int(cfg["report_cache_size"])
+        if self.report_cache_size < 1:
+            raise ValueError("report_cache_size must be at least 1")
         self.executor_id = occid.StringID.model_validate(cfg["executor_id"])
         self.asset_id = occid.StringID.model_validate(cfg["asset_id"])
 
@@ -179,6 +240,8 @@ class ExecutionIngress(PluginBase):
             response_topic=self.uav.response_topic,
         )
         self.active_execution_id: Any | None = None
+        self.active_dispatch_id: str | None = None
+        self.latest_reports: dict[str, Dict[str, Any]] = {}
 
     def _record_meta(self, bundle: ExecutionBundle) -> Any:
         now = time.time()
@@ -215,22 +278,50 @@ class ExecutionIngress(PluginBase):
             updated_ts=time.time(),
         )
 
+    def _entity_state(self, bundle: ExecutionBundle, location: Any) -> Any:
+        if location.attitude is None:
+            attitude = self.uav.attitude()
+            if attitude is not None:
+                location = location.model_copy(update={"attitude": attitude})
+        return occid.EntityState(
+            record=self._record_meta(bundle),
+            subject_id=self.asset_id,
+            timestamp=time.time(),
+            position=location,
+            links={},
+        )
+
+    def _remember_report(self, dispatch_id: str, payload: Dict[str, Any]) -> None:
+        self.latest_reports.pop(dispatch_id, None)
+        self.latest_reports[dispatch_id] = dict(payload)
+        while len(self.latest_reports) > self.report_cache_size:
+            oldest = next(iter(self.latest_reports))
+            self.latest_reports.pop(oldest, None)
+
     def _publish_execution_event(
         self,
         bundle: ExecutionBundle,
+        dispatch_id: str,
         state: str,
         *,
         task_delta: Any | None = None,
+        entity_state: Any | None = None,
         progress: float | None = None,
         error: str | None = None,
         detail: Dict[str, Any] | None = None,
     ) -> None:
         payload: Dict[str, Any] = {
             "state": state,
+            "report_id": (
+                task_delta.record.record_id.value
+                if task_delta is not None
+                else str(uuid.uuid4())
+            ),
             "execution_id": bundle.execution.execution_id.model_dump(mode="json"),
             "assignment_id": bundle.assignment.assignment_id.model_dump(mode="json"),
             "task_id": bundle.task.task_id.model_dump(mode="json"),
             "executor_id": self.executor_id.model_dump(mode="json"),
+            "dispatch_id": dispatch_id,
             "reported_at": time.time(),
         }
         if progress is not None:
@@ -241,6 +332,9 @@ class ExecutionIngress(PluginBase):
             payload["detail"] = dict(detail)
         if task_delta is not None:
             payload["task_delta_b64"] = _encode_native_b64(task_delta)
+        if entity_state is not None:
+            payload["entity_state_b64"] = _encode_native_b64(entity_state)
+        self._remember_report(dispatch_id, payload)
         self._publish_event(EVENT_KEY, payload)
 
     def _reject_busy_request(self, request: Dict[str, Any]) -> None:
@@ -253,6 +347,9 @@ class ExecutionIngress(PluginBase):
             {
                 "accepted": False,
                 "error": "execution ingress is busy",
+                "reason_code": "busy",
+                "retryable": True,
+                "active_dispatch_id": self.active_dispatch_id,
                 "active_execution_id": (
                     None
                     if self.active_execution_id is None
@@ -262,10 +359,49 @@ class ExecutionIngress(PluginBase):
         )
         self.flush_queue(self.response_queue, self.response_topic)
 
+    def _handle_status_query(self, request: Dict[str, Any]) -> None:
+        request_id = str(request.get("request_id", "unknown"))
+        action = str(request.get("action", "unknown"))
+        try:
+            params = request.get("params")
+            if type(params) is not dict:
+                raise ValueError("QUERY_EXECUTION params must be an object")
+            execution_id = occid.StringID.model_validate(params["execution_id"])
+            dispatch_id = str(params["dispatch_id"])
+            if not dispatch_id:
+                raise ValueError("QUERY_EXECUTION dispatch_id is required")
+            report = self.latest_reports.get(dispatch_id)
+            if report is not None:
+                reported_execution_id = occid.StringID.model_validate(report["execution_id"])
+                if reported_execution_id != execution_id:
+                    report = None
+            data = {
+                "found": report is not None,
+                "execution_id": execution_id.model_dump(mode="json"),
+                "dispatch_id": dispatch_id,
+            }
+            if report is not None:
+                data["report"] = dict(report)
+            self.enqueue_response(request_id, action, True, data)
+        except (KeyError, TypeError, ValueError) as exc:
+            self.enqueue_response(
+                request_id,
+                action,
+                False,
+                {"found": False, "error": str(exc)},
+            )
+        self.flush_queue(self.response_queue, self.response_topic)
+
+    def _handle_request_while_busy(self, request: Dict[str, Any]) -> None:
+        if str(request.get("action", "unknown")) == QUERY_ACTION:
+            self._handle_status_query(request)
+            return
+        self._reject_busy_request(request)
+
     def _pump_with_ingress(self, deadline: float | None = None) -> tuple[Any, Any]:
         topic, payload = self._pump_once(deadline)
         if topic == self.request_topic and payload is not None:
-            self._reject_busy_request(payload["data"])
+            self._handle_request_while_busy(payload["data"])
             return None, None
         return topic, payload
 
@@ -278,42 +414,134 @@ class ExecutionIngress(PluginBase):
                 raise RuntimeError(f"timeout waiting for UAV result id={request_id}")
             self._pump_with_ingress(deadline)
 
-    def _wait_for_position(self, timeout_s: float) -> Any:
+    def _wait_for_location(self, timeout_s: float) -> Any:
         deadline = time.monotonic() + float(timeout_s)
         while True:
             location = self.uav.location()
             if location is not None and location.position is not None:
-                return location.position
+                return location
             if time.monotonic() > deadline:
                 raise RuntimeError("timed out waiting for UAV LocationState.position")
             self._pump_with_ingress(deadline)
 
-    def _arrival_metrics(self, current: Any, destination: Any) -> tuple[float, float]:
-        horizontal_m = _distance_m(current, destination)
-        if current.alt_frame != destination.alt_frame:
-            raise RuntimeError(
-                "cannot evaluate arrival across different altitude datums: "
-                f"current={current.alt_frame.name} destination={destination.alt_frame.name}"
-            )
-        altitude_error_m = abs(float(current.alt) - float(destination.alt))
-        return horizontal_m, altitude_error_m
+    def _wait_until(self, predicate, timeout_s: float, error: str) -> None:
+        deadline = time.monotonic() + float(timeout_s)
+        while True:
+            if predicate():
+                return
+            if time.monotonic() > deadline:
+                raise RuntimeError(error)
+            self._pump_with_ingress(deadline)
 
-    def _execute_move(self, bundle: ExecutionBundle) -> None:
+    def _relative_altitude(self) -> float | None:
+        location = self.uav.location()
+        if location is None or location.altitude is None:
+            return None
+        if location.altitude.relative_datum != occid.AltitudeDatum.RELATIVE:
+            return None
+        return location.altitude.relative_m
+
+    def _prepare_vehicle_for_move(self, task: Any) -> None:
+        flight = self.uav.flight_control()
+        if flight is not None and bool(flight.in_air):
+            return
+        if not self.auto_takeoff_for_move:
+            raise RuntimeError(
+                "MoveTask requires an airborne vehicle when auto_takeoff_for_move is false"
+            )
+
+        takeoff_altitude_m = self.takeoff_altitude_m
+        if (
+            task.destination.alt_frame == occid.AltitudeDatum.RELATIVE
+            and float(task.destination.alt) > 0.0
+        ):
+            takeoff_altitude_m = min(takeoff_altitude_m, float(task.destination.alt))
+        if takeoff_altitude_m <= 0.0:
+            raise RuntimeError("MoveTask automatic takeoff altitude must be positive")
+
+        self.uav.execute(
+            occid.SetTakeoffAltitudeCommand(
+                relative_altitude_m=takeoff_altitude_m,
+            ),
+            timeout_s=self.response_timeout_s,
+        )
+        self._wait_until(
+            lambda: (
+                self.uav.flight_control() is not None
+                and self.uav.flight_control().readiness is not None
+                and bool(self.uav.flight_control().readiness.arm_ready)
+            ),
+            self.state_timeout_s,
+            "timed out waiting for UAV arm readiness",
+        )
+
+        flight = self.uav.flight_control()
+        if flight is None or not bool(flight.armed):
+            self.uav.execute(occid.ArmCommand(), timeout_s=self.response_timeout_s)
+            self._wait_until(
+                lambda: (
+                    self.uav.flight_control() is not None
+                    and bool(self.uav.flight_control().armed)
+                ),
+                self.state_timeout_s,
+                "timed out waiting for UAV armed state",
+            )
+
+        self._wait_until(
+            lambda: (
+                self.uav.flight_control() is not None
+                and bool(self.uav.flight_control().armed)
+                and self.uav.flight_control().readiness is not None
+                and bool(self.uav.flight_control().readiness.takeoff_ready)
+            ),
+            self.state_timeout_s,
+            "timed out waiting for UAV takeoff readiness",
+        )
+        self.uav.execute(occid.TakeoffCommand(), timeout_s=self.response_timeout_s)
+        self._wait_until(
+            lambda: (
+                self.uav.flight_control() is not None
+                and bool(self.uav.flight_control().in_air)
+                and self._relative_altitude() is not None
+                and float(self._relative_altitude())
+                >= takeoff_altitude_m * self.takeoff_altitude_ok_fraction
+            ),
+            self.state_timeout_s,
+            "timed out waiting for UAV takeoff",
+        )
+        if self.post_takeoff_wait_s > 0.0:
+            deadline = time.monotonic() + self.post_takeoff_wait_s
+            while time.monotonic() < deadline:
+                self._pump_with_ingress(deadline)
+
+    def _execute_move(self, bundle: ExecutionBundle, dispatch_id: str) -> None:
         task = bundle.task
         if not isinstance(task, occid.MoveTask):
             raise TypeError(f"unsupported task handler {type(task).__name__}; Block 1 supports MoveTask")
 
-        current = self._wait_for_position(self.state_timeout_s)
-        initial_distance_m, _ = self._arrival_metrics(current, task.destination)
-        denominator = max(initial_distance_m, self.arrival_radius_m, 0.01)
+        self._wait_for_location(self.state_timeout_s)
+        self._prepare_vehicle_for_move(task)
+        current = self._wait_for_location(self.state_timeout_s)
+        initial_distance_m, initial_altitude_error_m = _arrival_metrics(
+            current,
+            task.destination,
+        )
+        horizontal_denominator = max(initial_distance_m, self.arrival_radius_m, 0.01)
+        altitude_denominator = max(
+            initial_altitude_error_m,
+            self.arrival_altitude_tolerance_m,
+            0.01,
+        )
 
         command = occid.GoToCommand(position=task.destination)
         endpoint_result = self.uav.execute(command, timeout_s=self.response_timeout_s)
         running = self._task_delta(bundle, occid.TaskPhase.RUNNING, progress=0.0)
         self._publish_execution_event(
             bundle,
+            dispatch_id,
             "RUNNING",
             task_delta=running,
+            entity_state=self._entity_state(bundle, current),
             progress=0.0,
             detail={"endpoint_result": endpoint_result},
         )
@@ -323,11 +551,15 @@ class ExecutionIngress(PluginBase):
         while True:
             current = self.uav.location()
             if current is not None and current.position is not None:
-                horizontal_m, altitude_error_m = self._arrival_metrics(
-                    current.position,
+                horizontal_m, altitude_error_m = _arrival_metrics(
+                    current,
                     task.destination,
                 )
-                progress = max(0.0, min(1.0, 1.0 - (horizontal_m / denominator)))
+                remaining_fraction = max(
+                    horizontal_m / horizontal_denominator,
+                    altitude_error_m / altitude_denominator,
+                )
+                progress = max(0.0, min(1.0, 1.0 - remaining_fraction))
                 if (
                     horizontal_m <= self.arrival_radius_m
                     and altitude_error_m <= self.arrival_altitude_tolerance_m
@@ -339,8 +571,10 @@ class ExecutionIngress(PluginBase):
                     )
                     self._publish_execution_event(
                         bundle,
+                        dispatch_id,
                         "COMPLETED",
                         task_delta=complete,
+                        entity_state=self._entity_state(bundle, current),
                         progress=1.0,
                         detail={
                             "horizontal_error_m": horizontal_m,
@@ -358,8 +592,10 @@ class ExecutionIngress(PluginBase):
                     )
                     self._publish_execution_event(
                         bundle,
+                        dispatch_id,
                         "PROGRESS",
                         task_delta=delta,
+                        entity_state=self._entity_state(bundle, current),
                         progress=progress,
                         detail={
                             "horizontal_error_m": horizontal_m,
@@ -376,6 +612,7 @@ class ExecutionIngress(PluginBase):
 
     def _handle_execute(self, request: Dict[str, Any]) -> None:
         request_id = str(request.get("request_id", "unknown"))
+        dispatch_id = request_id
         action = str(request.get("action", "unknown"))
         if action != EXECUTE_ACTION:
             self.enqueue_response(
@@ -388,6 +625,7 @@ class ExecutionIngress(PluginBase):
             return
 
         bundle: ExecutionBundle | None = None
+        semantic_accepted = False
         try:
             params = request.get("params")
             if type(params) is not dict:
@@ -412,6 +650,7 @@ class ExecutionIngress(PluginBase):
             # it before the first UAV side effect so Sigma can distinguish the
             # boundary truthfully.
             self.active_execution_id = bundle.execution.execution_id
+            self.active_dispatch_id = dispatch_id
             self.enqueue_response(
                 request_id,
                 action,
@@ -419,10 +658,12 @@ class ExecutionIngress(PluginBase):
                 {
                     "accepted": True,
                     "execution_id": bundle.execution.execution_id.model_dump(mode="json"),
+                    "dispatch_id": dispatch_id,
                     "handler": type(bundle.task).__name__,
                 },
             )
             self.flush_queue(self.response_queue, self.response_topic)
+            semantic_accepted = True
             accepted = self._task_delta(
                 bundle,
                 occid.TaskPhase.DISPATCHED,
@@ -430,15 +671,16 @@ class ExecutionIngress(PluginBase):
             )
             self._publish_execution_event(
                 bundle,
+                dispatch_id,
                 "REMOTE_ACCEPTED",
                 task_delta=accepted,
                 progress=0.0,
                 detail={"handler": type(bundle.task).__name__},
             )
 
-            self._execute_move(bundle)
+            self._execute_move(bundle, dispatch_id)
         except Exception as exc:
-            if bundle is None:
+            if not semantic_accepted:
                 self.enqueue_response(
                     request_id,
                     action,
@@ -448,15 +690,27 @@ class ExecutionIngress(PluginBase):
                 self.flush_queue(self.response_queue, self.response_topic)
             else:
                 failed = self._task_delta(bundle, occid.TaskPhase.DONE_FAIL)
+                location = self.uav.location()
                 self._publish_execution_event(
                     bundle,
+                    dispatch_id,
                     "FAILED",
                     task_delta=failed,
+                    entity_state=(
+                        None
+                        if location is None or location.position is None
+                        else self._entity_state(bundle, location)
+                    ),
                     error=str(exc),
                 )
-                self.publish_error(traceback.format_exc().strip())
+                print(
+                    f"[EXECUTION_FAILED] dispatch_id={dispatch_id} error={exc}\n"
+                    f"{traceback.format_exc().strip()}",
+                    flush=True,
+                )
         finally:
             self.active_execution_id = None
+            self.active_dispatch_id = None
 
     def run(self) -> None:
         self.send_online()
@@ -467,7 +721,11 @@ class ExecutionIngress(PluginBase):
                     time.monotonic() + self.poll_interval_s
                 )
                 if topic == self.request_topic and payload is not None:
-                    self._handle_execute(payload["data"])
+                    request = payload["data"]
+                    if str(request.get("action", "unknown")) == QUERY_ACTION:
+                        self._handle_status_query(request)
+                    else:
+                        self._handle_execute(request)
         except KeyboardInterrupt:
             pass
         except RuntimeError:

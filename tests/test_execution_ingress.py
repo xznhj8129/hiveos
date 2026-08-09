@@ -7,6 +7,7 @@ import uuid
 
 from lib.occid_bus import occid
 from plugins.execution_ingress.execution_ingress import (
+    _arrival_metrics,
     _distance_m,
     decode_execution_bundle,
 )
@@ -52,11 +53,27 @@ class ExecutionIngressContractTests(unittest.TestCase):
             assignment_id=sid("assignment-1"),
             task_id=self.task.task_id,
             assignee_id=self.asset_id,
+            plan_id=sid("plan-1"),
             authority="sigma.fixture",
             assigned_by=sid("sigma.fixture"),
             assigned_at=time.time(),
             status=occid.AssignmentStatus.ASSIGNED,
             constraints=[],
+        )
+        self.plan = occid.Plan(
+            record=record(),
+            plan_id=self.assignment.plan_id,
+            name="test plan",
+            objective_ids=[],
+            task_ids=[self.task.task_id],
+            actor_ids=[self.asset_id],
+            resource_ids=[],
+            assignments=[],
+            steps=[],
+            routes=[],
+            constraints=[],
+            contingencies=[],
+            approval_state=occid.PlanApprovalState.APPROVED,
         )
         self.execution = occid.Execution(
             record=record(),
@@ -67,11 +84,12 @@ class ExecutionIngressContractTests(unittest.TestCase):
             external_job_refs=[],
         )
 
-    def params(self, assignment=None, task=None) -> dict:
+    def params(self, assignment=None, task=None, plan=None) -> dict:
         return {
             "execution_b64": native_b64(self.execution),
             "assignment_b64": native_b64(assignment or self.assignment),
             "task_b64": native_b64(task or self.task),
+            "plan_b64": native_b64(plan or self.plan),
         }
 
     def test_valid_bundle_preserves_sigma_execution_identity(self) -> None:
@@ -87,9 +105,24 @@ class ExecutionIngressContractTests(unittest.TestCase):
             decode_execution_bundle(self.params(assignment=bad_assignment))
 
     def test_plan_reference_requires_plan_payload(self) -> None:
-        bad_assignment = self.assignment.model_copy(update={"plan_id": sid("plan-1")})
+        params = self.params()
+        params.pop("plan_b64")
         with self.assertRaisesRegex(ValueError, "plan_b64"):
-            decode_execution_bundle(self.params(assignment=bad_assignment))
+            decode_execution_bundle(params)
+
+    def test_unapproved_plan_is_rejected_independently(self) -> None:
+        draft = self.plan.model_copy(
+            update={"approval_state": occid.PlanApprovalState.DRAFT}
+        )
+        with self.assertRaisesRegex(ValueError, "not approved"):
+            decode_execution_bundle(self.params(plan=draft))
+
+    def test_non_executable_assignment_is_rejected_independently(self) -> None:
+        proposed = self.assignment.model_copy(
+            update={"status": occid.AssignmentStatus.PROPOSED}
+        )
+        with self.assertRaisesRegex(ValueError, "not executable"):
+            decode_execution_bundle(self.params(assignment=proposed))
 
     def test_horizontal_distance_is_metric_and_symmetric(self) -> None:
         a = occid.GlobalPosition(
@@ -109,6 +142,40 @@ class ExecutionIngressContractTests(unittest.TestCase):
         self.assertAlmostEqual(ab, ba, places=6)
         self.assertGreater(ab, 110.0)
         self.assertLess(ab, 112.0)
+
+    def test_relative_arrival_uses_relative_altitude_observation(self) -> None:
+        location = occid.LocationState(
+            position=occid.GlobalPosition(
+                lat=47.397742,
+                lon=8.545594,
+                alt=510.0,
+                alt_frame=occid.AltitudeDatum.SEA_LEVEL,
+            ),
+            altitude=occid.AltitudeState(
+                absolute_m=510.0,
+                absolute_datum=occid.AltitudeDatum.SEA_LEVEL,
+                relative_m=18.5,
+                relative_datum=occid.AltitudeDatum.RELATIVE,
+            ),
+        )
+        horizontal_m, altitude_error_m = _arrival_metrics(
+            location,
+            self.task.destination,
+        )
+        self.assertAlmostEqual(horizontal_m, 0.0, places=6)
+        self.assertAlmostEqual(altitude_error_m, 1.5, places=6)
+
+    def test_arrival_rejects_missing_requested_altitude_datum(self) -> None:
+        location = occid.LocationState(
+            position=occid.GlobalPosition(
+                lat=47.397742,
+                lon=8.545594,
+                alt=510.0,
+                alt_frame=occid.AltitudeDatum.SEA_LEVEL,
+            )
+        )
+        with self.assertRaisesRegex(RuntimeError, "no altitude observation"):
+            _arrival_metrics(location, self.task.destination)
 
 
 if __name__ == "__main__":

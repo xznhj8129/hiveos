@@ -18,13 +18,13 @@ from mavsdk.action import ActionError
 from mavsdk.info import InfoError
 from mavsdk.offboard import Attitude, OffboardError
 
-from interop.common import radians_to_degrees
 from interop.mavsdk import (
     MavsdkPositionFields,
     angular_velocity_from_body_rates,
     attitude_from_euler_degrees,
     attitude_setpoint_to_fields,
     gnss_fix_type_from_native_value,
+    goto_command_to_fields,
     position_to_location_state,
     standard_mode_from_native_name,
 )
@@ -286,23 +286,21 @@ class MavsdkInterface(PluginBase):
             elif isinstance(command, occid.SetTakeoffAltitudeCommand):
                 await self.drone.action.set_takeoff_altitude(float(command.relative_altitude_m))
             elif isinstance(command, occid.GoToCommand):
-                position = command.position
-                if position.alt_frame == occid.AltitudeDatum.SEA_LEVEL:
-                    target_abs_alt_m = float(position.alt)
-                elif position.alt_frame == occid.AltitudeDatum.RELATIVE:
-                    if self.last_abs_alt_m is None or self.last_rel_alt_m is None:
-                        raise UnsupportedCommand("relative GoTo requires current absolute and relative altitude")
-                    target_abs_alt_m = float(self.last_abs_alt_m) + (float(position.alt) - float(self.last_rel_alt_m))
-                else:
-                    raise UnsupportedCommand(f"unsupported GoTo altitude datum {position.alt_frame}")
-                if command.yaw_rad is not None:
-                    yaw_deg = radians_to_degrees(float(command.yaw_rad), "yaw_rad")
-                elif self.last_attitude is not None:
-                    yaw_deg = radians_to_degrees(float(self.last_attitude.yaw_rad), "yaw_rad")
-                else:
-                    yaw_deg = 0.0
+                fields = goto_command_to_fields(
+                    command,
+                    current_absolute_altitude_m=self.last_abs_alt_m,
+                    current_relative_altitude_m=self.last_rel_alt_m,
+                    current_yaw_rad=(
+                        None
+                        if self.last_attitude is None
+                        else float(self.last_attitude.yaw_rad)
+                    ),
+                )
                 await self.drone.action.goto_location(
-                    float(position.lat), float(position.lon), target_abs_alt_m, yaw_deg
+                    fields.latitude_deg,
+                    fields.longitude_deg,
+                    fields.absolute_altitude_m,
+                    fields.yaw_deg,
                 )
             elif isinstance(command, occid.SetModeCommand):
                 await self._handle_set_mode(command)

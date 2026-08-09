@@ -26,7 +26,8 @@ class Px4SitlGzLauncher(PluginBase):
         self.poll_interval_s = float(cfg["poll_interval_s"])
         self.px4_cfg = cfg["px4"]
         self.gz_cfg = cfg["gazebo"]
-        self.px4_dir = Path(self.px4_cfg["px4_dir"]).resolve()
+        px4_path = os.environ.get("PX4_AUTOPILOT_PATH") or self.px4_cfg["px4_dir"]
+        self.px4_dir = Path(px4_path).expanduser().resolve()
         self.log_file = Path(cfg["log_file"]).resolve()
         self.shell_pid_file = Path(cfg["shell_pid_file"]).resolve()
         self.term_proc: subprocess.Popen | None = None

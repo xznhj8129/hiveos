@@ -264,6 +264,52 @@ Set `OCCID_PATH` if the OCCID repository is not a sibling of MPFC:
 export OCCID_PATH=/path/to/occid
 ```
 
+### Sigma Block 1 execution host
+
+The supported Stage 2 path is one Sigma-created `MoveTask`, one MPFC instance
+named `uav1`, and one PX4 vehicle. Install only the dependencies needed by this
+path with:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-stage2.txt
+export OCCID_PATH=/absolute/path/to/occid
+```
+
+Use `flight_cores/execution_host/config.yaml` when PX4 is already running and
+sending its companion MAVLink stream to UDP port 14540:
+
+```bash
+MAIN_CONFIG=flight_cores/execution_host/config.yaml python main.py
+```
+
+That generic host does not arm or take off implicitly. Start with an airborne
+vehicle or make an explicit deployment decision to enable the local preparation
+policy. The dedicated SITL fixture below opts in safely for its disposable
+simulated vehicle.
+
+Use `config_px4_sitl.yaml` to let MPFC start a sibling PX4-Autopilot checkout
+and Gazebo. `PX4_AUTOPILOT_PATH` takes precedence over the path in the YAML:
+
+```bash
+export PX4_AUTOPILOT_PATH=/absolute/path/to/PX4-Autopilot
+MAIN_CONFIG=flight_cores/execution_host/config_px4_sitl.yaml python main.py
+```
+
+The execution ingress validates the exact OCCID Execution, Assignment, Plan,
+and Task bundle before semantic acceptance. For the acceptance fixture it may
+arm and take off a fresh SITL vehicle, then sends `GoToCommand` through
+`uav_controller` and the MAVSDK adapter. Completion requires observed
+horizontal and datum-correct vertical arrival. Each progress report also
+carries the observed `LocationState` as an OCCID `EntityState` for Sigma.
+
+The ingress retains only the latest report for a bounded number of dispatches
+in process memory (`report_cache_size`, default 128). Sigma can query a report
+by exact Execution and dispatch identity after a Sigma restart. Restarting MPFC
+clears this cache, so this is explicit bounded reconciliation, not a durable
+distributed log.
+
 Runtime smoke test:
 
 ```bash
