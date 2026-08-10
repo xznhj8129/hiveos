@@ -36,16 +36,14 @@ install -d -o mpfc -g mpfc -m 0755 /var/log/mpfc /run/mpfc
 python3 -m venv /opt/mpfc/.venv
 /opt/mpfc/.venv/bin/python -m pip install --upgrade pip setuptools wheel
 
-# MPFC requirements are authoritative, except HiveLink itself: the appliance
-# deliberately uses the checked-out /opt/hivelink project rather than a PyPI
-# copy so MPFC, OCCID and HiveLink are the only source repositories required.
-grep -Ev '^[[:space:]]*hivelink([<=>!~ ].*)?$' /opt/mpfc/requirements.txt > /tmp/mpfc-requirements.txt
-/opt/mpfc/.venv/bin/pip install -r /tmp/mpfc-requirements.txt
+# Install the deliberately narrow runtime dependency set used by the companion
+# appliance. HiveLink is installed from the checked-out /opt/hivelink project,
+# keeping MPFC, OCCID and HiveLink as the only source repositories required.
+/opt/mpfc/.venv/bin/pip install -r /opt/mpfc/requirements-runtime.txt
 if [[ -f /opt/hivelink/requirements.txt ]]; then
     /opt/mpfc/.venv/bin/pip install -r /opt/hivelink/requirements.txt
 fi
 /opt/mpfc/.venv/bin/pip install -e /opt/hivelink
-rm -f /tmp/mpfc-requirements.txt
 
 rsync -a /opt/mpfc/deploy/rpi/rootfs/ /
 install -m 0755 /opt/mpfc/deploy/rpi/run-mpfc /opt/mpfc/deploy/rpi/configure-fc
