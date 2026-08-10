@@ -2,11 +2,13 @@
 ## Multi-Protocol Flight Computer
 *Monty Python's Flying Clankers*
 
-MPFC is a lightweight, bus-first runtime for autonomous and remotely controlled robotic systems. A user-written **Program** expresses the purpose of the system. Reusable **plugins** provide capabilities such as UAV control, MAVLink, MSP, CoT/ATAK, tracking, vision, and datalinks.
+MPFC is a lightweight companion-computer runtime for autonomous and remotely controlled robotic systems.
 
-MPFC deliberately keeps the runtime simple: normal Python processes, MQTT IPC, explicit plugins, and readable Programs. OCCID is the common semantic model inside the runtime.
+A user-written **Program** expresses what the system should do. Reusable **plugins** provide capabilities such as UAV control, MAVLink, MSP, CoT/ATAK, tracking, vision, and datalinks. **OCCID** is the common semantic model used between those components, while MQTT provides local IPC and routing.
 
-> The current code still uses the historical names `flight_cores/`, `CoreBase`, and `run_core()`. Conceptually these are Programs. Renaming the code surface is a separate cleanup after the OCCID migration is stable.
+MPFC deliberately avoids turning the companion computer into a large framework. The runtime is normal Python processes, explicit configuration, readable Programs, and small adapters around real external systems.
+
+The current source still uses the historical names `flight_cores/`, `CoreBase`, and `run_core()` for Programs. Those names predate the current architecture and are retained for compatibility while the OCCID migration settles.
 
 ## Architecture
 
@@ -15,40 +17,62 @@ MPFC deliberately keeps the runtime simple: normal Python processes, MQTT IPC, e
 
                          Program
                             |
-             reusable plugin/API capabilities
+               reusable capability APIs
                             |
-          +-----------------+-----------------+
-          |                 |                 |
-   uav_controller       atak_interface     tracker/CV
-          |                 |                 |
-          | OCCID           | OCCID           | OCCID
-          v                 v                 v
-   +-------------+       CoT/ATAK          MCVST/etc.
+          +-----------------+------------------+
+          |                 |                  |
+   uav_controller       atak_interface      tracker/CV
+          |                 |                  |
+          | OCCID           | OCCID            | OCCID
+          v                 v                  v
+   +-------------+       CoT/ATAK           MCVST/etc.
    |             |
    v             v
 mavsdk_interface msp_interface
    |             |
-MAVLink/MSDK     MSP
+MAVSDK/MAVLink   MSP
    |             |
 PX4/ArduPilot    INAV/Betaflight
 ```
 
 The boundaries are intentional:
 
-- **Program** - the main thing being run: take off and land, turn tracker data into flight commands, patrol an area, operate a payload, etc.
-- **Plugin** - reusable functional API or external-system interface.
-- **`uav_controller`** - stable Program-facing UAV service. It applies reusable vehicle policy/readiness, accepts only immediate UAV OCCID command/input families, and speaks OCCID to Programs and endpoint adapters.
-- **Endpoint adapters** - translate OCCID directly to or from native mechanisms such as MAVSDK/MAVLink, MSP, or CoT.
-- **MQTT** - local IPC and routing only.
-- **OCCID** - semantic model. There is no separate MPFC UAV/ATAK/CV ontology.
+- **Program**: the main behavior being run, for example patrol an area, track a target, operate a payload, or execute assigned work.
+- **Plugin**: reusable capability logic or an interface to an external system.
+- **`uav_controller`**: the stable Program-facing UAV service. It owns reusable vehicle readiness and command policy and exposes OCCID operations to Programs.
+- **Endpoint adapters**: translate OCCID to and from native mechanisms such as MAVSDK/MAVLink, MSP, or CoT.
+- **Execution ingress**: accepts higher-level OCCID execution bundles and delegates concrete local behavior through the normal Program and UAV interfaces.
+- **MQTT**: local IPC and routing. MQTT topics are not the semantic model.
+- **OCCID**: operational meaning shared across MPFC components and external systems.
+- **HiveLink**: optional datalink integration for moving traffic across constrained or heterogeneous links. MPFC does not depend on HiveLink for its local runtime semantics.
 
-A component that translates OCCID into another internal MPFC semantic vocabulary is probably in the wrong place. A component that consumes OCCID, applies real policy or behavior, and emits OCCID is fine.
+A component that merely translates OCCID into another MPFC-specific semantic vocabulary is probably in the wrong place. Components may consume OCCID, apply real policy or behavior, and emit OCCID without inventing a second ontology.
 
-Higher-level OCCID `Task`, `Plan`, `Assignment`, and `Execution` lifecycle semantics are intentionally not accepted by `uav_controller` merely because they ultimately derive from `Command`. They belong to the OCCID-native MPFC execution ingress that owns local Program selection and high-level execution.
+## Project dependencies
+
+At the source-project level MPFC is designed to live beside only two related repositories:
+
+```text
+parent/
+  mpfc/
+  occid/
+  hivelink/
+```
+
+- **OCCID** provides the canonical Python SDK and operational data model.
+- **HiveLink** provides the optional datalink implementation used by `hivelink_interface`.
+- Everything else is an ordinary Python or operating-system package dependency declared by the projects.
+
+MPFC loads OCCID from either:
+
+1. `OCCID_PATH`, pointing at the OCCID repository root, or
+2. a sibling `occid/` checkout beside MPFC.
+
+The Raspberry Pi appliance also installs the sibling HiveLink checkout directly so its filesystem contains the same three project trees used during development.
 
 ## Program style
 
-Programs should read like intent, not protocol plumbing. For UAV Programs the convenience API in `lib/uav_client.py` constructs and consumes OCCID models:
+Programs should read like intent, not protocol plumbing. The UAV convenience API in `lib/uav_client.py` constructs and consumes OCCID models:
 
 ```python
 uav.set_takeoff_altitude(10.0)
@@ -59,35 +83,34 @@ uav.return_to_launch()
 uav.land()
 ```
 
-Those convenience methods dispatch commands and return request IDs without blocking for an endpoint result. A Program that genuinely needs to wait can explicitly call `uav.execute(command)`.
+Those convenience methods dispatch commands and return request IDs without blocking for endpoint completion. A Program that actually needs to wait for an endpoint result can explicitly call `uav.execute(command)`.
 
-The same Program-facing API can be backed by PX4/MAVSDK, ArduPilot/MAVSDK, INAV/MSP, or another future adapter without introducing another semantic protocol or pretending that every endpoint has the same request/reply mechanics.
+The same Program-facing API can be backed by PX4/MAVSDK, ArduPilot/MAVSDK, INAV/MSP, or another future adapter without introducing another semantic protocol or pretending that every endpoint has identical mechanics.
 
-`px4_guide` in `mpfc_additions` is the higher-rate example: tracker state and UAV state are OCCID, guidance math remains in radians, and attitude setpoints go through the UAV service. The MAVSDK adapter alone converts radians to MAVSDK's degree API.
-
-High-rate direct control is intentionally separate from command RPC. A Program begins a direct-control session, publishes latest-value OCCID `Input` samples, then ends the session:
+High-rate direct control is separate from command RPC. A Program opens a direct-control session, publishes latest-value OCCID `Input` samples, then releases the session:
 
 ```python
 uav.begin_direct_control(occid.DirectControlMode.ATTITUDE_THRUST)
 uav.set_attitude(roll_rad, pitch_rad, yaw_rad, thrust)
-# ...more latest-value setpoints...
+# publish more latest-value setpoints
 uav.end_direct_control()
 ```
 
-`ControlAttitudeSetpoint` and `ControlOverride` samples do not receive a request ID or per-sample response.
+`ControlAttitudeSetpoint` and `ControlOverride` samples do not receive a request ID or one response per sample.
 
-## OCCID
+## OCCID inside MPFC
 
-OCCID is maintained separately in the `occid` repository. MPFC imports the canonical `occid` Python SDK namespace and loads it either from:
+Transient MQTT payloads render OCCID models directly as JSON-compatible fields tagged with:
 
-1. `OCCID_PATH`, pointing at the OCCID repository root, or
-2. a sibling `occid/` checkout beside the MPFC repository.
+```text
+_occid_model
+_occid_model_id
+_occid_schema_version
+```
 
-The generic top-level Python package name `schema` is no longer part of the MPFC consumer boundary.
+This keeps the local bus inspectable with ordinary MQTT tools while retaining deterministic type identity. OCCID's versioned MsgPack `encode()` representation remains available for transports that need a compact binary representation.
 
-Transient MQTT payloads render OCCID models directly as JSON-compatible fields, tagged with `_occid_model`, `_occid_model_id`, and `_occid_schema_version` so they remain typed and deterministic while still being readable in ordinary MQTT debugging tools. OCCID's versioned MsgPack `encode()` representation remains the compact binary representation for transports that actually need it. The current semantic schema version is 4.
-
-Representative state streams include:
+Representative state routes include:
 
 ```text
 flight_control
@@ -109,38 +132,40 @@ entity_state
 cot_raw
 ```
 
-These strings are routing keys, not types. The tagged OCCID model inside `data` defines the semantics.
+These strings are routing keys, not types. The OCCID model inside `data` defines the semantics.
 
-The MSP adapter restores information that was accidentally dropped during the first OCCID cutover rather than treating awkward native data as disposable: receiver bounds, channel maps, mode ranges, RC state, GNSS diagnostics, onboard mission validity/capacity/current waypoint, and selected flight sensor hardware now have explicit OCCID representations. `SetWaypointCommand` also maps to the native MSP waypoint write.
+The MSP adapter intentionally preserves awkward native information rather than discarding it because it is inconvenient to map. Receiver bounds, channel maps, mode ranges, RC state, GNSS diagnostics, onboard mission state, selected sensor hardware, waypoint writes, and related endpoint details have explicit OCCID representations where MPFC currently needs them.
 
 ## UAV path
 
 ```text
 Program
   |
-  | UavClient convenience API
+  | UavClient
   |   commands -> REQUEST
   |   direct-control samples -> INPUT
   v
 uav_controller
   |
-  | type-gated OCCID in / OCCID out
+  | OCCID in / OCCID out
   v
 selected endpoint adapter
   |
-  +-- mavsdk_interface -> MAVSDK/MAVLink -> PX4 or ArduPilot
-  +-- msp_interface    -> MSP            -> INAV/Betaflight
+  +-- mavsdk_interface  -> MAVSDK/MAVLink -> PX4 or ArduPilot
+  +-- msp_interface     -> MSP            -> INAV or Betaflight
   +-- liftoff_interface -> simulator telemetry
 ```
 
-Immediate UAV commands are decomposed by meaning:
+Immediate UAV operations are decomposed by meaning:
 
-- `FlightCommand` - arm, disarm, takeoff, land, RTL, and takeoff-altitude configuration.
-- `NavigationCommand` - GoTo, waypoint write, and onboard mission selection.
-- `ModeCommand` - mode activation/deactivation. Takeoff, land, and RTL are not encoded as mode changes.
-- `DirectControlCommand` - begin/end a portable direct-control session.
+- `FlightCommand`: arm, disarm, takeoff, land, RTL, and takeoff-altitude configuration.
+- `NavigationCommand`: GoTo, waypoint write, and onboard mission selection.
+- `ModeCommand`: flight-mode activation or deactivation when the endpoint supports it.
+- `DirectControlCommand`: begin or end a portable direct-control session.
 
-High-rate `ControlAttitudeSetpoint` and `ControlOverride` values are OCCID `Input` models rather than command wrappers. Endpoint adapters own the corresponding native lifecycle such as PX4/MAVSDK offboard, MAVSDK manual control, or MSP RC override.
+High-rate `ControlAttitudeSetpoint` and `ControlOverride` values are OCCID `Input` models rather than command wrappers. Endpoint adapters own native control lifecycle such as PX4/MAVSDK offboard mode, MAVSDK manual control, or MSP RC override.
+
+Higher-level OCCID `Task`, `Plan`, `Assignment`, and `Execution` records do not go through `uav_controller` merely because they eventually produce vehicle commands. The execution ingress owns that higher-level lifecycle and delegates immediate UAV work through `uav_controller`.
 
 ## Reference-frame contract
 
@@ -149,86 +174,65 @@ MPFC follows these conventions unless an OCCID record explicitly states otherwis
 - body frame: FRD
 - inertial/world frame: NED
 - angular values: radians
-- angular velocity: radians/second
-- altitude values: meters, positive upward, with explicit datum where needed
-- simultaneous absolute and relative altitude observations keep independent vertical datums
+- angular velocity: radians per second
+- altitude values: meters, positive upward, with an explicit datum where needed
+- simultaneous absolute and relative altitude observations retain independent vertical datums
 - normalized pilot/control axes use signed `-1..+1` semantic control position
-- adapters own PWM/MAVSDK/native conversion, including endpoints with reversible throttle/thrust
+- endpoint adapters own PWM, MAVSDK, protocol, and unit conversion
 
-Frame fields may be optional in OCCID when context is genuinely sufficient, but code performing transforms or control must validate the frames it depends on. `test_takeoff_land` deliberately checks this contract.
+Frame fields may be optional in OCCID when context is genuinely sufficient, but code performing transforms or control must validate the frames it depends on.
 
-CoT `hae` is WGS84 ellipsoid height, not mean-sea-level altitude. CoT/TAK UID is also an external protocol identity, not an OCCID logical subject ID; the ATAK adapter keeps the correlation boundary explicit.
+CoT `hae` is WGS84 ellipsoid height, not mean-sea-level altitude. CoT/TAK UID is also an external protocol identity, not an OCCID logical subject ID. The ATAK adapter keeps those boundaries explicit.
 
 ## Plugins
 
-Important current plugins:
+Important current plugins include:
 
 | Plugin | Role |
 | --- | --- |
-| `uav_controller` | Program-facing UAV API/service and reusable flight readiness/policy |
-| `mavsdk_interface` | OCCID <-> MAVSDK/MAVLink endpoint adapter for PX4 and ArduPilot |
-| `msp_interface` | OCCID <-> MSP endpoint adapter for INAV/Betaflight |
-| `liftoff_interface` | OCCID telemetry adapter for Liftoff simulation |
-| `atak_interface` | OCCID <-> CoT/ATAK adapter over UDP/TCP |
-| `hivelink_interface` | HiveLink datalink integration; semantic OCCID transport work is separate |
-| `yolo_detector` | Vision inference plugin |
-| `example_hello` | Minimal OCCID request/response runtime smoke test |
+| `uav_controller` | Program-facing UAV service and reusable flight readiness/policy |
+| `execution_ingress` | OCCID execution bundle validation, dispatch, progress, and result reporting |
+| `mavsdk_interface` | OCCID to/from MAVSDK/MAVLink for PX4 and ArduPilot |
+| `msp_interface` | OCCID to/from MSP for INAV and Betaflight |
+| `liftoff_interface` | simulator telemetry adapter |
+| `atak_interface` | OCCID to/from CoT/ATAK over UDP/TCP |
+| `hivelink_interface` | optional HiveLink datalink bridge |
+| `yolo_detector` | vision inference plugin |
+| `example_hello` | minimal OCCID request/response example |
 
-`atak_interface` publishes parsed CoT position updates as OCCID `EntityState` and can also expose raw CoT XML as `ProtocolPayload`. Outbound requests can translate OCCID `EntityState`, `HumanTextMessage`, or raw XML `ProtocolPayload` to CoT.
+`atak_interface` publishes parsed CoT position updates as OCCID `EntityState` and can expose raw CoT XML as `ProtocolPayload`. Outbound traffic can translate supported OCCID records back to CoT.
+
+`hivelink_interface` bridges MPFC datalink traffic into HiveLink transports. HiveLink is currently optional and is not required for ordinary local UAV control, PX4 SITL, or the Raspberry Pi companion appliance to function.
 
 ## MQTT bus
 
-Every process is an MQTT peer. The outer envelope is runtime metadata, while `data` stays directly inspectable:
+Every MPFC process is an MQTT peer. Topics are prefixed with:
 
-```json
-{
-  "client": "mavsdk",
-  "topic": "uav1/STATE/location",
-  "time": 1770835200000,
-  "data": {
-    "_occid_model": "LocationState",
-    "_occid_model_id": 206,
-    "_occid_schema_version": [4, 0, 0],
-    "inertial_frame": "NED",
-    "body_frame": null,
-    "position": {
-      "_occid_model": "GlobalPosition",
-      "_occid_model_id": 196,
-      "_occid_schema_version": [4, 0, 0],
-      "lat": 45.5017,
-      "lon": -73.5673,
-      "alt": 37.2,
-      "mgrs": null,
-      "datum": "WGS84",
-      "alt_frame": "SEA_LEVEL"
-    },
-    "uncertainty": null,
-    "attitude": null,
-    "altitude": null,
-    "velocity": null,
-    "navigation_validity": null,
-    "gnss": null
-  }
-}
+```text
+mpfc/<instance>/
 ```
 
-Topics are prefixed with `mpfc/<instance>/`.
-
-Common routing patterns:
+Common routing patterns are:
 
 | Pattern | Purpose |
 | --- | --- |
 | `CONTROL/<command>` | runtime lifecycle/control |
 | `SET/<client_id>` | runtime parameter mutation |
-| `<client>/<ns>/REQUEST` | correlated command/plugin request |
+| `<client>/<ns>/REQUEST` | correlated command or plugin request |
 | `<client>/<ns>/RESPONSE` | eventual correlated result |
-| `<client>/<ns>/INPUT` | latest-value OCCID input stream, no per-sample response |
+| `<client>/<ns>/INPUT` | latest-value OCCID input stream |
 | `<client>/<ns>/STATE/<route>` | rate-limited OCCID state stream |
 | `DIAG/<client>/<event>` | diagnostics and lifecycle |
 
-Request IDs, response correlation, timeouts, state-rate scheduling, and MQTT envelopes are IPC mechanics. They do not form a second semantic protocol. `uav_controller` forwards backend command results asynchronously rather than blocking its event loop. MSP remains free to use request/reply internally; MAVSDK/MAVLink and streamed controls are not forced into that mechanic.
+Request IDs, response correlation, timeouts, state-rate scheduling, and MQTT envelopes are IPC mechanics. They do not form a second semantic protocol.
 
-## Vehicle/backend selection
+For example, state remains readable with a normal MQTT client:
+
+```bash
+mosquitto_sub -h 127.0.0.1 -p 1883 -v -t 'mpfc/#'
+```
+
+## Vehicle and backend selection
 
 Vehicle configuration uses OCCID enums:
 
@@ -239,9 +243,9 @@ vehicle:
   telem_type: TelemetryType.MAVLINK
 ```
 
-`main.py` resolves plugin templates, selects exactly one compatible endpoint adapter, injects it into `uav_controller`, and binds the Program to `uav_controller`.
+`main.py` resolves plugin templates, selects exactly one compatible endpoint adapter, injects it into `uav_controller`, and binds the Program to the controller.
 
-For an INAV/MSP system:
+For an INAV/MSP vehicle:
 
 ```yaml
 vehicle:
@@ -250,85 +254,65 @@ vehicle:
   telem_type: TelemetryType.MSP
 ```
 
-## Examples
+## Quick start
 
-Install Python dependencies and ensure Mosquitto is available:
+Install Mosquitto and create an isolated Python environment:
 
 ```bash
+sudo apt install mosquitto mosquitto-clients python3-venv
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Set `OCCID_PATH` if the OCCID repository is not a sibling of MPFC:
+If OCCID is not a sibling checkout:
 
 ```bash
-export OCCID_PATH=/path/to/occid
-```
-
-### Sigma Block 1 execution host
-
-The supported Stage 2 path is one Sigma-created `MoveTask`, one MPFC instance
-named `uav1`, and one PX4 vehicle. Install only the dependencies needed by this
-path with:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements-stage2.txt
 export OCCID_PATH=/absolute/path/to/occid
 ```
 
-Use `flight_cores/execution_host/config.yaml` when PX4 is already running and
-sending its companion MAVLink stream to UDP port 14540:
+Run the minimal runtime example:
+
+```bash
+MAIN_CONFIG=flight_cores/test_core/config.yaml python main.py
+```
+
+### PX4 execution host
+
+When PX4 is already running and sending its companion MAVLink stream to UDP port `14540`:
 
 ```bash
 MAIN_CONFIG=flight_cores/execution_host/config.yaml python main.py
 ```
 
-That generic host does not arm or take off implicitly. Start with an airborne
-vehicle or make an explicit deployment decision to enable the local preparation
-policy. The dedicated SITL fixture below opts in safely for its disposable
-simulated vehicle.
+This generic execution host does not implicitly arm or take off a real vehicle. Preparation policy is explicit configuration, not a side effect of receiving arbitrary work.
 
-Use `config_px4_sitl.yaml` to let MPFC start a sibling PX4-Autopilot checkout
-and Gazebo. `PX4_AUTOPILOT_PATH` takes precedence over the path in the YAML:
+For local PX4 SITL with a sibling `PX4-Autopilot` checkout:
 
 ```bash
 export PX4_AUTOPILOT_PATH=/absolute/path/to/PX4-Autopilot
 MAIN_CONFIG=flight_cores/execution_host/config_px4_sitl.yaml python main.py
 ```
 
-The execution ingress validates the exact OCCID Execution, Assignment, Plan,
-and Task bundle before semantic acceptance. For the acceptance fixture it may
-arm and take off a fresh SITL vehicle, then sends `GoToCommand` through
-`uav_controller` and the MAVSDK adapter. Completion requires observed
-horizontal and datum-correct vertical arrival. Each progress report also
-carries the observed `LocationState` as an OCCID `EntityState` for Sigma.
+The SITL configuration may prepare its disposable simulated vehicle when required. The execution ingress validates the OCCID Execution, Assignment, Plan, and Task relationships before semantic acceptance, delegates resulting UAV commands through `uav_controller`, and determines movement completion from observed vehicle state rather than command acknowledgement alone.
 
-The ingress retains only the latest report for a bounded number of dispatches
-in process memory (`report_cache_size`, default 128). Sigma can query a report
-by exact Execution and dispatch identity after a Sigma restart. Restarting MPFC
-clears this cache, so this is explicit bounded reconciliation, not a durable
-distributed log.
+The ingress retains a bounded latest report cache for recent dispatches so an external controller can query exact Execution and dispatch identities after losing transient MQTT evidence. Restarting MPFC clears that in-memory cache; it is bounded reconciliation, not a durable distributed log.
 
-Runtime smoke test:
+## Other examples
 
-```bash
-MAIN_CONFIG=flight_cores/test_core/config.yaml python main.py
-```
-
-PX4 SITL acceptance Program:
+PX4 SITL takeoff/land example:
 
 ```bash
 MAIN_CONFIG=flight_cores/test_takeoff_land/config_px4.yaml python main.py
 ```
 
-ArduPilot/MAVSDK acceptance Program:
+ArduPilot/MAVSDK takeoff/land example:
 
 ```bash
 MAIN_CONFIG=flight_cores/test_takeoff_land/config.yaml python main.py
 ```
 
-INAV/MSP telemetry example:
+INAV/MSP example:
 
 ```bash
 MAIN_CONFIG=flight_cores/example_msp/config.yaml python main.py
@@ -346,9 +330,101 @@ CoT/ATAK example:
 MAIN_CONFIG=flight_cores/atak_example/config.yaml python main.py
 ```
 
+## Raspberry Pi companion appliance
+
+`deploy/rpi/` defines the reference Raspberry Pi Zero 2 W class MPFC companion computer.
+
+It produces one Raspberry Pi OS Lite 64-bit image that serves two purposes:
+
+1. burn it directly to an SD card for a physical Pi Zero 2 W;
+2. boot the exact same raw image under QEMU as a disposable, known-good virtual companion computer.
+
+The image contains:
+
+```text
+/opt/mpfc
+/opt/occid
+/opt/hivelink
+/opt/mpfc/.venv
+Mosquitto
+OpenSSH
+systemd MPFC services
+runtime and diagnostic tools
+```
+
+Build it with:
+
+```bash
+sudo apt install \
+  git curl rsync xz-utils parted e2fsprogs \
+  qemu-system-arm qemu-user-static binfmt-support \
+  dosfstools mtools
+
+sudo ./deploy/rpi/build-image
+```
+
+The main artifact is:
+
+```text
+deploy/rpi/dist/mpfc-rpi-zero2w.img
+```
+
+The builder also writes a SHA256 file, build manifest, and QEMU kernel/DTB sidecars. The manifest records the source revisions embedded in the image.
+
+### Physical Pi
+
+The physical appliance uses a MAVSDK serial URL. The default image endpoint is:
+
+```text
+serial:///dev/serial0:921600
+```
+
+The deployment procedure should explicitly assign the FC tty selected for that aircraft:
+
+```bash
+sudo /opt/mpfc/deploy/rpi/configure-fc /dev/ttyAMA0 921600
+```
+
+A USB/UART adapter works the same way:
+
+```bash
+sudo /opt/mpfc/deploy/rpi/configure-fc /dev/ttyUSB0 460800
+```
+
+The selected endpoint is stored in `/etc/mpfc/runtime.env` and used by `mpfc.service` on boot.
+
+### Virtual Pi
+
+Start the same image as a disposable virtual companion:
+
+```bash
+./deploy/rpi/pi-vm start
+```
+
+The VM uses QEMU's Pi 3A+ model with four Cortex-A53 cores and 512 MiB RAM, close to the useful compute and memory budget of a Pi Zero 2 W. Guest disk writes use QEMU snapshot mode so the base image remains known-good.
+
+The VM overrides only the FC connection:
+
+```text
+udp://:14540
+```
+
+Useful commands:
+
+```bash
+./deploy/rpi/pi-vm ssh
+./deploy/rpi/pi-vm logs
+./deploy/rpi/pi-vm deploy
+./deploy/rpi/pi-vm stop
+```
+
+`deploy` rsyncs the current MPFC checkout and sibling OCCID/HiveLink checkouts into the running VM and restarts MPFC, so normal Python development does not require rebuilding the SD image.
+
+See [`deploy/rpi/README.md`](deploy/rpi/README.md) for appliance build, burn, VM, and troubleshooting details.
+
 ## Lifecycle and supervision
 
-`main.py` starts the Program and plugins as separate processes and monitors diagnostics.
+`main.py` starts the Program and plugins as separate processes and monitors their diagnostics:
 
 ```text
 DIAG/<id>/STARTING
@@ -360,29 +436,38 @@ A child crash or `DIAG/.../ERROR` triggers coordinated shutdown through `CONTROL
 
 Shared runtime machinery lives under `lib/`:
 
-- `common.py` - config, topics, MQTT routing, waits, request correlation
-- `core_base.py` - current Program base class
-- `plugin_base.py` - plugin lifecycle/response helpers
-- `state_scheduler.py` - rate-limited state publishing
-- `occid_bus.py` - OCCID packing/unpacking plus command and input helpers
-- `occid_topics.py` - local routing keys only
-- `uav_client.py` - Program-facing UAV convenience API
-- `geo_utils.py` / `reference_frames.py` - geometry/frame helpers
+- `common.py`: configuration, topics, MQTT routing, waits, and request correlation
+- `core_base.py`: current Program base class
+- `plugin_base.py`: plugin lifecycle and response helpers
+- `state_scheduler.py`: rate-limited state publishing
+- `occid_bus.py`: OCCID packing, unpacking, commands, and inputs
+- `occid_topics.py`: local routing keys
+- `uav_client.py`: Program-facing UAV convenience API
+- `geo_utils.py` and `reference_frames.py`: geometry and frame helpers
 
-## Development rules
+On the Raspberry Pi appliance, MPFC runs as `mpfc.service` and can be watched with:
+
+```bash
+journalctl -fu mpfc.service
+```
+
+## Design rules
 
 - Put operational meaning in OCCID, not MPFC-local schema files.
-- Minimal OCCID means minimum demonstrated coverage, not shallow semantics. Use `deep_ontology` as a semantic reference quarry when a real requirement exposes a missing distinction.
 - Programs express intent and policy.
 - Reusable capability logic belongs in plugins or small client facades.
-- `uav_controller` accepts only its declared immediate UAV command/input families; generic `Command` is not an authorization boundary.
-- Endpoint-specific protocol quirks and native lifecycle belong at the endpoint adapter.
+- `uav_controller` accepts only its declared immediate UAV command and input families; generic `Command` is not an authorization boundary.
+- Higher-level Task/Plan/Assignment/Execution lifecycle belongs at the execution boundary, not in the endpoint adapter.
+- Endpoint-specific protocol quirks and native lifecycle belong in the endpoint adapter.
 - Common semantics do not require common mechanics. Do not force request/reply, streaming, acknowledgements, or native control lifecycle to look identical across protocols.
 - MQTT topics route messages; they do not define semantic types.
-- Keep frame/unit/datum/native-identity conversions explicit at protocol boundaries.
-- Do not create a Task/Execution lifecycle or synchronous RPC for high-rate direct-control samples.
-- Add OCCID model coverage when a real Program or adapter demonstrates the need for it, and preserve useful endpoint information rather than discarding it because it is inconvenient to map.
+- Keep frame, unit, datum, and native-identity conversions explicit at protocol boundaries.
+- Do not create synchronous RPC semantics for high-rate direct-control samples.
+- Preserve useful endpoint information rather than dropping it because it is inconvenient to represent.
+- Add OCCID model coverage when a real Program or adapter demonstrates the requirement.
 
 ## Status
 
-MPFC is pre-1.0 and evolving quickly. The OCCID migration is intentionally replacing the old internal `protocols/` namespace system rather than maintaining both systems in parallel.
+MPFC is pre-1.0 and evolving quickly. The current architecture is OCCID-native and is replacing the historical MPFC-specific protocol/schema layer rather than maintaining two semantic systems in parallel.
+
+The Raspberry Pi appliance is the reference companion-computer deployment target. PX4/MAVSDK and INAV/MSP remain separate endpoint implementations behind the same Program-facing UAV boundary.
