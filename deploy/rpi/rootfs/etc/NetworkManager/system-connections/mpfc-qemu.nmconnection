@@ -2,7 +2,6 @@
 id=mpfc-qemu
 uuid=26e8dc48-9335-4b3a-8c2d-6b0d885e48d0
 type=ethernet
-interface-name=usb0
 autoconnect=true
 
 [ethernet]
