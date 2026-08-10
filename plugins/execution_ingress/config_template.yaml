@@ -1,7 +1,6 @@
 plugin: execution_ingress
 cfg:
   id: execution_ingress
-  topic_ns: EXECUTION
   poll_interval_s: 0.1
   response_timeout_s: 20.0
   state_timeout_s: 60.0
@@ -14,6 +13,8 @@ cfg:
   takeoff_altitude_ok_fraction: 0.8
   post_takeoff_wait_s: 1.0
   report_cache_size: 128
+  occid_in_topic: OCCID/IN
+  occid_out_topic: OCCID/OUT
   executor_id:
     id_type: DB_ID
     value: mpfc:<my_name>
@@ -23,5 +24,3 @@ cfg:
   interface:
     id: uav_controller
     topic_ns: UAV
-  event_keys:
-  - execution
