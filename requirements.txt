@@ -1,7 +1,6 @@
 mavsdk
 pymavlink
 hivelink
-frogproto
 paho-mqtt
 numpy
 filterpy
