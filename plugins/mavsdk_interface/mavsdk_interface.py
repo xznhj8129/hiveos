@@ -57,8 +57,6 @@ class MavsdkInterface(PluginBase):
     def __init__(self, cfg: Dict[str, Any], bus_config: Dict[str, Any]) -> None:
         super().__init__(cfg, bus_config)
         apply_cfg(self, cfg)
-        if self.conn_type != "udp":
-            raise RuntimeError(f"unsupported conn_type {self.conn_type}")
         self.system_address = self.conn_str
         self.is_ardupilot = str(self.mav_dialect).upper() == "ARDUPILOT"
         if self.mavsdk_log_debug:
@@ -500,8 +498,6 @@ class MavsdkInterface(PluginBase):
                 float(output.yaw),
             )
             if not self.manual_control_started:
-                # MAVSDK exposes manual-axis control through an explicit native
-                # control mode. That lifecycle stays inside this adapter.
                 await self.drone.manual_control.start_altitude_control()
                 self.manual_control_started = True
             if override is not None:
@@ -533,9 +529,9 @@ class MavsdkInterface(PluginBase):
                 await asyncio.sleep(0.2)
 
     async def _async_main(self) -> None:
-        print(f"[PLUGIN] {self.client_id} connecting type={self.conn_type} address={self.system_address}", flush=True)
+        print(f"[PLUGIN] {self.client_id} connecting address={self.system_address}", flush=True)
         await self.drone.connect(system_address=self.system_address)
-        print(f"[PLUGIN] {self.client_id} connected type={self.conn_type} address={self.system_address}", flush=True)
+        print(f"[PLUGIN] {self.client_id} connected address={self.system_address}", flush=True)
 
         async for state in self.drone.core.connection_state():
             if state.is_connected:
