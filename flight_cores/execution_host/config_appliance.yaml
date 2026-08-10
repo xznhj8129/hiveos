@@ -22,10 +22,18 @@ bus_config:
     port: 1883
 
 plugins:
+- plugin: hivelink_interface
+  cfg:
+    link_config:
+      nodemap:
+        control:
+          ip:
+          - 192.168.0.220
+          - 5555
+
 - plugin: execution_ingress
   cfg:
     id: execution_ingress
-    topic_ns: EXECUTION
     auto_takeoff_for_move: false
     executor_id:
       id_type: DB_ID
