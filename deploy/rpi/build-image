@@ -58,7 +58,7 @@ if [[ ${EUID} -ne 0 ]]; then
     exit 1
 fi
 
-for cmd in curl xz sha256sum losetup mount umount mountpoint rsync chroot blkid truncate realpath git; do
+for cmd in curl xz sha256sum losetup mount umount mountpoint rsync chroot truncate realpath git parted e2fsck resize2fs; do
     command -v "${cmd}" >/dev/null || { echo "missing host command: ${cmd}" >&2; exit 1; }
 done
 if [[ ! -x /usr/bin/qemu-aarch64-static ]]; then
@@ -90,16 +90,12 @@ if [[ -z ${BASE_IMAGE} ]]; then
     fi
 fi
 
-if [[ -n ${BASE_SHA256} ]]; then
-    actual_sha=$(sha256sum "${BASE_IMAGE}" | awk '{print $1}')
-    if [[ ${actual_sha} != ${BASE_SHA256} ]]; then
-        echo "base image SHA256 mismatch" >&2
-        echo "expected: ${BASE_SHA256}" >&2
-        echo "actual:   ${actual_sha}" >&2
-        exit 1
-    fi
-else
-    actual_sha=$(sha256sum "${BASE_IMAGE}" | awk '{print $1}')
+actual_sha=$(sha256sum "${BASE_IMAGE}" | awk '{print $1}')
+if [[ -n ${BASE_SHA256} && ${actual_sha} != ${BASE_SHA256} ]]; then
+    echo "base image SHA256 mismatch" >&2
+    echo "expected: ${BASE_SHA256}" >&2
+    echo "actual:   ${actual_sha}" >&2
+    exit 1
 fi
 
 WORK_IMAGE=${WORK_ROOT}/root.img
@@ -108,9 +104,11 @@ case "${BASE_IMAGE}" in
     *) cp --reflink=auto "${BASE_IMAGE}" "${WORK_IMAGE}" ;;
 esac
 
-# QEMU's Raspberry Pi SD model expects a power-of-two card size. 4 GiB also
-# leaves the stock Lite filesystem enough room to boot and expand on hardware.
+# QEMU's Raspberry Pi SD model wants a power-of-two card size. Actually grow
+# partition 2 and its ext4 filesystem too; merely truncating the file would not
+# give apt/pip any additional space during the image build.
 truncate -s "${IMAGE_SIZE}" "${WORK_IMAGE}"
+parted -s "${WORK_IMAGE}" resizepart 2 100%
 
 LOOP=
 ROOT_MNT=${WORK_ROOT}/root
@@ -133,6 +131,16 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
     sleep 0.2
 done
 [[ -b ${LOOP}p1 && -b ${LOOP}p2 ]] || { echo "base image partitions did not appear" >&2; exit 1; }
+
+set +e
+e2fsck -f -y "${LOOP}p2"
+FSCK_STATUS=$?
+set -e
+if (( FSCK_STATUS > 1 )); then
+    echo "e2fsck failed with status ${FSCK_STATUS}" >&2
+    exit "${FSCK_STATUS}"
+fi
+resize2fs "${LOOP}p2"
 
 mkdir -p "${ROOT_MNT}"
 mount "${LOOP}p2" "${ROOT_MNT}"
