@@ -5,7 +5,9 @@ RUN_DIR=/run/mpfc
 MOUNT_DIR=${RUN_DIR}/config-media
 LABEL_PATH=/dev/disk/by-label/MPFC_CONFIG
 
-install -d -m 0755 "${RUN_DIR}"
+# /run is a tmpfs and is recreated on every boot. The launcher runs as mpfc and
+# writes /run/mpfc/config.yaml, so restore ownership before the service starts.
+install -d -o mpfc -g mpfc -m 0755 "${RUN_DIR}"
 rm -f "${RUN_DIR}/runtime.env"
 
 # A physical Pi normally has no MPFC_CONFIG volume. Give the QEMU USB storage
