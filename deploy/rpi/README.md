@@ -26,8 +26,9 @@ On a Debian/Ubuntu/Mint development machine:
 
 ```bash
 sudo apt install \
+  git curl rsync xz-utils parted e2fsprogs \
   qemu-system-arm qemu-user-static binfmt-support \
-  dosfstools mtools rsync xz-utils curl
+  dosfstools mtools
 ```
 
 Keep the three source repositories as siblings:
