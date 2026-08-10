@@ -19,14 +19,6 @@ cfg:
       radio_serial: ''
       app_portnum: 260
       channel: 0
-    mqtt:
-      use: false
-      base: /hivelink/v2
-      broker: ''
-      port: 1883
-      client_id: ''
-      username: ''
-      password: ''
     nodemap:
       control:
         ip:
