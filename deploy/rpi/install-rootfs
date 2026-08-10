@@ -51,6 +51,7 @@ rsync -a /opt/mpfc/deploy/rpi/rootfs/ /
 install -m 0755 /opt/mpfc/deploy/rpi/run-mpfc /opt/mpfc/deploy/rpi/configure-fc
 install -m 0755 /opt/mpfc/deploy/rpi/rootfs/usr/local/sbin/mpfc-runtime-config /usr/local/sbin/mpfc-runtime-config
 chmod 0440 /etc/sudoers.d/mpfc
+chmod 0600 /etc/NetworkManager/system-connections/mpfc-qemu.nmconnection
 
 # Make the primary UART available on real hardware. The deployment script still
 # chooses the concrete tty device and baud with configure-fc.
