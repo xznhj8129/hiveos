@@ -59,14 +59,12 @@ class HiveLinkPlugin(PluginBase):
 
         udp_cfg = dict(link_cfg.get("udp") or {})
         mesh_cfg = dict(link_cfg.get("meshtastic") or {})
-        mqtt_cfg = dict(link_cfg.get("mqtt") or {})
 
         self.default_udp = bool(udp_cfg.get("use", True))
         self.default_mesh = bool(mesh_cfg.get("use", False))
         self.default_multicast = bool(udp_cfg.get("use_multicast", False))
 
         my_name = str(link_cfg["my_name"])
-        mqtt_client_id = str(mqtt_cfg.get("client_id") or my_name)
         self.interface_params = {
             "use_meshtastic": self.default_mesh,
             "use_udp": self.default_udp,
@@ -74,20 +72,15 @@ class HiveLinkPlugin(PluginBase):
             "socket_host": str(udp_cfg.get("host", "0.0.0.0")),
             "socket_port": int(udp_cfg.get("port", 5555)),
             "multicast_group": str(udp_cfg.get("multicast_group", "")),
-            "multicast_port": int(udp_cfg.get("multicast_port", udp_cfg.get("port", 5555))),
+            "multicast_port": int(
+                udp_cfg.get("multicast_port", udp_cfg.get("port", 5555))
+            ),
             "my_name": my_name,
             "my_id": int(link_cfg.get("my_id", 0)),
             "nodemap": dict(link_cfg.get("nodemap") or {}),
             "radio_port": mesh_cfg.get("radio_serial"),
             "meshtastic_dataport": int(mesh_cfg.get("app_portnum", 260)),
             "meshtastic_channel": int(mesh_cfg.get("channel", 0)),
-            "mqtt_enable": bool(mqtt_cfg.get("use", False)),
-            "mqtt_broker": str(mqtt_cfg.get("broker", "")),
-            "mqtt_port": int(mqtt_cfg.get("port", 1883)),
-            "mqtt_client_id": mqtt_client_id,
-            "mqtt_username": mqtt_cfg.get("username"),
-            "mqtt_password": mqtt_cfg.get("password"),
-            "mqtt_base": str(mqtt_cfg.get("base", "/hivelink/v2")),
         }
 
         self.client.subscribe(self.out_topic)
@@ -121,7 +114,9 @@ class HiveLinkPlugin(PluginBase):
                     for task in pending:
                         task.cancel()
                     if pending:
-                        self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+                        self.loop.run_until_complete(
+                            asyncio.gather(*pending, return_exceptions=True)
+                        )
                     self.loop.close()
 
     def _flush_inbound(self) -> None:
@@ -132,11 +127,11 @@ class HiveLinkPlugin(PluginBase):
                 return
             model = msg["model"]
             source = str(msg["from"])
-            intf = str(msg["intf"])
+            interface = str(msg["intf"])
             received_at = float(msg.get("time", time.time()))
             data = {
                 "source": source,
-                "interface": intf,
+                "interface": interface,
                 "received_at": received_at,
                 "model": pack_occid(model),
             }
@@ -145,7 +140,8 @@ class HiveLinkPlugin(PluginBase):
                 build_envelope(self.client_id, self.in_topic, data),
             )
             print(
-                f"[HIVELINK_RX] source={source} interface={intf} model={type(model).__name__}",
+                f"[HIVELINK_RX] source={source} interface={interface} "
+                f"model={type(model).__name__}",
                 flush=True,
             )
 
