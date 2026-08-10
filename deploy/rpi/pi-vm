@@ -5,9 +5,9 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 VM_DIR=${SCRIPT_DIR}/.vm
 DEFAULT_IMAGE=${SCRIPT_DIR}/dist/mpfc-rpi-zero2w.img
 IMAGE=${MPFC_PI_IMAGE:-${DEFAULT_IMAGE}}
-CONTROL_IP=${MPFC_CONTROL_IP:-192.168.0.220}
-GUEST_IP=${MPFC_PI_IP:-192.168.0.230}
-PREFIX=${MPFC_PI_PREFIX:-24}
+CONTROL_IP=192.168.0.220
+GUEST_IP=192.168.0.230
+PREFIX=24
 BRIDGE=${MPFC_PI_BRIDGE:-cfbr0}
 TAP=${MPFC_PI_TAP:-cfmpfc0}
 SSH_KEY=${MPFC_PI_SSH_KEY:-${HOME}/.ssh/id_ed25519}
@@ -16,19 +16,20 @@ usage() {
     cat <<EOF_USAGE
 Usage: ${0##*/} <command> [options]
 
+Reference network:
+  control host  ${CONTROL_IP}/${PREFIX}
+  MPFC guest    ${GUEST_IP}/${PREFIX}
+
 Commands:
   up       Run a disposable Pi VM in the foreground
   start    Run it in the background
-  stop     Stop a background VM and remove its private bridge/tap
-  ssh      SSH directly to the guest IP
+  stop     Stop a background VM and remove its bridge/tap
+  ssh      SSH directly to ${GUEST_IP}
   logs     Follow mpfc.service logs
   deploy   Rsync MPFC + sibling OCCID/HiveLink into the guest and restart
 
 Options used by up/start:
   --image PATH         Appliance raw image, default ${DEFAULT_IMAGE}
-  --control-ip IP      Host/control bridge address, default ${CONTROL_IP}
-  --guest-ip IP        Guest address, default ${GUEST_IP}
-  --prefix N           Private network prefix length, default ${PREFIX}
   --bridge NAME        Linux bridge, default ${BRIDGE}
   --tap NAME           QEMU tap device, default ${TAP}
   --ssh-key PATH       SSH private key; PATH.pub is injected into the VM
@@ -42,9 +43,6 @@ shift
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --image) IMAGE=$2; shift 2 ;;
-        --control-ip) CONTROL_IP=$2; shift 2 ;;
-        --guest-ip) GUEST_IP=$2; shift 2 ;;
-        --prefix) PREFIX=$2; shift 2 ;;
         --bridge) BRIDGE=$2; shift 2 ;;
         --tap) TAP=$2; shift 2 ;;
         --ssh-key) SSH_KEY=$2; shift 2 ;;
@@ -131,7 +129,7 @@ EOF_ENV
     if [[ -f ${SSH_KEY}.pub ]]; then
         mcopy -o -i "${CFG_IMAGE}" "${SSH_KEY}.pub" ::authorized_keys
     else
-        echo "warning: ${SSH_KEY}.pub not found; SSH helper commands will not work until a key is injected" >&2
+        echo "warning: ${SSH_KEY}.pub not found; SSH helper commands require an injected key" >&2
     fi
 }
 
@@ -198,7 +196,7 @@ run_qemu() {
         qemu-system-aarch64 "${daemon_args[@]}" \
             -display none -serial null -monitor none \
             -daemonize -pidfile "${PID_FILE}"
-        echo "MPFC Pi VM started: guest ${GUEST_IP}, control ${CONTROL_IP}, bridge ${BRIDGE}, tap ${TAP}"
+        echo "MPFC Pi VM started: control ${CONTROL_IP} <-> guest ${GUEST_IP}"
         return
     fi
 
