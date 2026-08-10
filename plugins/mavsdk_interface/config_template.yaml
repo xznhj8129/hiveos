@@ -9,7 +9,6 @@ cfg:
     - AutopilotType.ARDUPILOT
     telem_type:
     - TelemetryType.MAVLINK
-  conn_type: udp
   conn_str: udp://:14550
   mav_dialect: PX4
   mav_type: MAV_TYPE_QUADROTOR
