@@ -96,6 +96,7 @@ ${IMAGE}.raspi3ap.dtb
 rw console=ttyAMA1,115200 root=/dev/mmcblk0p2 rootfstype=ext4 rootwait fsck.repair=yes net.ifnames=0
 -drive
 file=${IMAGE},format=raw,if=sd,index=0,snapshot=on
+-usb
 -drive
 if=none,id=mpfccfg,format=raw,file=${CFG_IMAGE},readonly=on
 -device
@@ -117,8 +118,6 @@ run_qemu() {
     make_config_disk
     mapfile -t args < <(qemu_args)
     if [[ ${daemonize} == 1 ]]; then
-        # qemu_args contains the interactive console settings. Remove those for
-        # a daemonized VM so QEMU never tries to keep stdio open.
         local daemon_args=()
         local i=0
         while (( i < ${#args[@]} )); do
