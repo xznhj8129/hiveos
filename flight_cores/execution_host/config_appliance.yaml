@@ -12,8 +12,6 @@ core:
     poll_interval_s: 0.25
 
 bus_config:
-  # Absolute paths keep this config relocatable when the appliance launcher
-  # writes a runtime copy under /run/mpfc.
   schema_path: /opt/mpfc/config/bus_topics_schema.json
   log_file: /var/log/mpfc/hivebus.log
   endpoint:
@@ -25,6 +23,7 @@ plugins:
 - plugin: hivelink_interface
   cfg:
     link_config:
+      my_name: uav1
       nodemap:
         control:
           ip:
@@ -54,10 +53,7 @@ plugins:
     id: mavsdk
     topic_ns: UAV
     is_interface: true
-    # The appliance launcher replaces conn_str from MPFC_MAVLINK_CONNECTION.
-    # Keep conn_type at udp for compatibility with the current adapter gate;
-    # MAVSDK itself selects the real transport from the URL in conn_str.
-    conn_type: udp
+    # deploy/rpi/run-mpfc replaces this URL from MPFC_MAVLINK_CONNECTION.
     conn_str: serial:///dev/serial0:921600
     mav_dialect: PX4
     mav_type: MAV_TYPE_QUADROTOR
