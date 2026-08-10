@@ -1,6 +1,0 @@
-# Narrow dependency set for the Block 1 Sigma -> MPFC -> PX4 path.
-mavsdk
-paho-mqtt>=1.6,<3
-PyYAML>=6
-pydantic>=2.6
-msgpack>=1.0
