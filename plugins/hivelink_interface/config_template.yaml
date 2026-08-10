@@ -6,7 +6,6 @@ cfg:
   in_topic: OCCID/IN
   out_topic: OCCID/OUT
   link_config:
-    my_name: <my_name>
     my_id: 0
     udp:
       use: true
