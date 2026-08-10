@@ -34,16 +34,6 @@ from lib.occid_bus import occid
 
 CONFIG_ENV = "MAIN_CONFIG"
 PLACEHOLDER_RE = re.compile(r"<([A-Za-z0-9_]+)>")
-ENUM_TOKEN_RE = re.compile(r"[^A-Za-z0-9]+")
-
-# Config spelling compatibility only. These aliases are not semantic protocol
-# aliases and are normalized immediately into OCCID enum member names.
-ENUM_ALIASES = {
-    occid.TelemetryType: {
-        "MAVLINK2": "MAVLINK",
-        "MAVLINK1": "MAVLINK",
-    },
-}
 
 
 def parse_runtime_overrides(argv: list[str]) -> Dict[str, str]:
@@ -149,27 +139,32 @@ def apply_plugin_config_templates(config: Dict[str, Any], repo_root: Path) -> No
     config["plugins"] = merged_plugins
 
 
-def normalize_enum_token(value: str) -> str:
-    return ENUM_TOKEN_RE.sub("", value).upper()
-
-
 def resolve_enum_value(raw_value: Any, enum_type: Any) -> str:
     if type(raw_value) is not str:
-        raise RuntimeError(f"invalid enum value type enum={enum_type.__name__} type={type(raw_value).__name__}")
+        raise RuntimeError(
+            f"invalid enum value type enum={enum_type.__name__} "
+            f"type={type(raw_value).__name__}"
+        )
     token = raw_value.strip()
     if "." in token:
-        _, token = token.rsplit(".", 1)
-    normalized = normalize_enum_token(token)
-    normalized = ENUM_ALIASES.get(enum_type, {}).get(normalized, normalized)
-    for member in enum_type:
-        if normalize_enum_token(member.name) == normalized:
-            return member.name
-    raise RuntimeError(f"unknown OCCID enum value enum={enum_type.__name__} value={raw_value}")
+        enum_name, token = token.rsplit(".", 1)
+        if enum_name != enum_type.__name__:
+            raise RuntimeError(
+                f"wrong OCCID enum type expected={enum_type.__name__} value={raw_value}"
+            )
+    if token not in enum_type.__members__:
+        raise RuntimeError(
+            f"unknown OCCID enum value enum={enum_type.__name__} value={raw_value}"
+        )
+    return token
 
 
 def resolve_enum_list(raw_values: Any, enum_type: Any) -> list[str]:
     if type(raw_values) is not list:
-        raise RuntimeError(f"invalid enum list type enum={enum_type.__name__} type={type(raw_values).__name__}")
+        raise RuntimeError(
+            f"invalid enum list type enum={enum_type.__name__} "
+            f"type={type(raw_values).__name__}"
+        )
     return [resolve_enum_value(raw_value, enum_type) for raw_value in raw_values]
 
 
@@ -180,11 +175,9 @@ def resolve_vehicle_config(config: Dict[str, Any]) -> Dict[str, str] | None:
     if type(vehicle) is not dict:
         raise RuntimeError(f"invalid vehicle config type {type(vehicle).__name__}")
     vehicle["autopilot"] = resolve_enum_value(vehicle["autopilot"], occid.AutopilotType)
-    raw_airframe = vehicle.get("airframe", vehicle.get("uav_type"))
-    if raw_airframe is None:
+    if "airframe" not in vehicle:
         raise RuntimeError("vehicle config missing airframe")
-    vehicle["airframe"] = resolve_enum_value(raw_airframe, occid.AirframeType)
-    vehicle.pop("uav_type", None)
+    vehicle["airframe"] = resolve_enum_value(vehicle["airframe"], occid.AirframeType)
     vehicle["telem_type"] = resolve_enum_value(vehicle["telem_type"], occid.TelemetryType)
     return vehicle
 
@@ -196,7 +189,10 @@ def resolve_plugin_supports(config: Dict[str, Any]) -> None:
         if supports is None:
             continue
         if type(supports) is not dict:
-            raise RuntimeError(f"invalid supports config type plugin={plugin_entry['plugin']} type={type(supports).__name__}")
+            raise RuntimeError(
+                f"invalid supports config type plugin={plugin_entry['plugin']} "
+                f"type={type(supports).__name__}"
+            )
         supports["autopilot"] = resolve_enum_list(supports["autopilot"], occid.AutopilotType)
         supports["telem_type"] = resolve_enum_list(supports["telem_type"], occid.TelemetryType)
 
@@ -205,7 +201,10 @@ def plugin_supports_vehicle(plugin_cfg: Dict[str, Any], vehicle: Dict[str, str])
     supports = plugin_cfg.get("supports")
     if type(supports) is not dict:
         return False
-    return vehicle["autopilot"] in supports["autopilot"] and vehicle["telem_type"] in supports["telem_type"]
+    return (
+        vehicle["autopilot"] in supports["autopilot"]
+        and vehicle["telem_type"] in supports["telem_type"]
+    )
 
 
 def configure_runtime_plugins(config: Dict[str, Any], vehicle: Dict[str, str] | None) -> None:
@@ -215,11 +214,15 @@ def configure_runtime_plugins(config: Dict[str, Any], vehicle: Dict[str, str] | 
         core_cfg["vehicle"] = dict(vehicle)
 
     # When a UAV controller is present it is the stable program-facing UAV API.
-    # The supervisor selects exactly one compatible endpoint adapter and injects
-    # that backend into the controller; programs never bind to MAVSDK/MSP directly.
-    controller_plugins = [entry for entry in plugins_raw if entry.get("cfg", {}).get("is_controller")]
+    # The supervisor selects exactly one endpoint adapter and injects that
+    # backend into the controller; programs never bind to MAVSDK/MSP directly.
+    controller_plugins = [
+        entry for entry in plugins_raw if entry.get("cfg", {}).get("is_controller")
+    ]
     if len(controller_plugins) > 1:
-        raise RuntimeError(f"multiple controller plugins configured count={len(controller_plugins)}")
+        raise RuntimeError(
+            f"multiple controller plugins configured count={len(controller_plugins)}"
+        )
     if controller_plugins:
         if vehicle is None:
             raise RuntimeError("vehicle config required when is_controller=true")
@@ -234,34 +237,60 @@ def configure_runtime_plugins(config: Dict[str, Any], vehicle: Dict[str, str] | 
         if len(matching_backends) != 1:
             backend_names = [entry["plugin"] for entry in matching_backends]
             raise RuntimeError(
-                f"expected exactly one backend interface match autopilot={vehicle['autopilot']} "
+                f"expected exactly one backend interface match "
+                f"autopilot={vehicle['autopilot']} "
                 f"telem_type={vehicle['telem_type']} matches={backend_names}"
             )
         backend_cfg = matching_backends[0]["cfg"]
-        controller_cfg["backend"] = {"id": backend_cfg["id"], "topic_ns": backend_cfg["topic_ns"]}
-        controller_cfg["backend_state_keys"] = list(backend_cfg["state_intervals"].keys())
-        controller_cfg["backend_event_keys"] = list(backend_cfg.get("event_keys", []))
+        controller_cfg["backend"] = {
+            "id": backend_cfg["id"],
+            "topic_ns": backend_cfg["topic_ns"],
+        }
+        controller_cfg["backend_state_keys"] = list(
+            backend_cfg["state_intervals"].keys()
+        )
+        controller_cfg["backend_event_keys"] = list(
+            backend_cfg.get("event_keys", [])
+        )
         controller_cfg["vehicle"] = dict(vehicle)
-        expected_interface = {"id": controller_cfg["id"], "topic_ns": controller_cfg["topic_ns"]}
+        expected_interface = {
+            "id": controller_cfg["id"],
+            "topic_ns": controller_cfg["topic_ns"],
+        }
         if "interface" in core_cfg and core_cfg["interface"] != expected_interface:
-            raise RuntimeError(f"core interface must target controller expected={expected_interface} actual={core_cfg['interface']}")
+            raise RuntimeError(
+                f"core interface must target controller expected={expected_interface} "
+                f"actual={core_cfg['interface']}"
+            )
         core_cfg["interface"] = expected_interface
         return
 
     if "interface" in core_cfg:
         return
-    interface_plugins = [entry for entry in plugins_raw if entry.get("cfg", {}).get("is_interface")]
+    interface_plugins = [
+        entry for entry in plugins_raw if entry.get("cfg", {}).get("is_interface")
+    ]
     if vehicle is not None:
-        interface_plugins = [entry for entry in interface_plugins if plugin_supports_vehicle(entry["cfg"], vehicle)]
+        interface_plugins = [
+            entry
+            for entry in interface_plugins
+            if plugin_supports_vehicle(entry["cfg"], vehicle)
+        ]
     if len(interface_plugins) == 1:
         intf_cfg = interface_plugins[0]["cfg"]
-        core_cfg["interface"] = {"id": intf_cfg["id"], "topic_ns": intf_cfg["topic_ns"]}
+        core_cfg["interface"] = {
+            "id": intf_cfg["id"],
+            "topic_ns": intf_cfg["topic_ns"],
+        }
         return
     if len(interface_plugins) > 1:
-        raise RuntimeError("multiple interface plugins require explicit core.cfg.interface or one matching vehicle backend")
+        raise RuntimeError(
+            "multiple interface plugins require explicit core.cfg.interface or one matching vehicle backend"
+        )
     if vehicle is not None:
         raise RuntimeError(
-            f"no interface plugin supports autopilot={vehicle['autopilot']} telem_type={vehicle['telem_type']}"
+            f"no interface plugin supports autopilot={vehicle['autopilot']} "
+            f"telem_type={vehicle['telem_type']}"
         )
 
 
@@ -291,7 +320,11 @@ def start_from_config(config_path: Path, overrides: Dict[str, str]) -> None:
     endpoint_cfg = raw_bus_config["endpoint"]
     etype = endpoint_cfg.get("type")
     if etype == "tcp":
-        endpoint = {"type": "tcp", "host": endpoint_cfg.get("host"), "port": endpoint_cfg.get("port")}
+        endpoint = {
+            "type": "tcp",
+            "host": endpoint_cfg.get("host"),
+            "port": endpoint_cfg.get("port"),
+        }
     elif etype == "unix":
         endpoint_path = Path(endpoint_cfg.get("path"))
         if not endpoint_path.is_absolute():
@@ -345,13 +378,19 @@ def start_from_config(config_path: Path, overrides: Dict[str, str]) -> None:
         plugin_runner = getattr(plugin_module, "run_plugin")
         plugin_entries.append({"cfg": plugin_cfg, "runner": plugin_runner})
 
-    core_proc = mp.Process(target=core_runner, args=(core_cfg, bus_config), name=f"core-{core_cfg.get('id','?')}")
+    core_proc = mp.Process(
+        target=core_runner,
+        args=(core_cfg, bus_config),
+        name=f"core-{core_cfg.get('id','?')}",
+    )
     core_proc.start()
     plugin_procs = []
     for entry in plugin_entries:
         plugin_cfg = entry["cfg"]
         proc = mp.Process(
-            target=entry["runner"], args=(plugin_cfg, bus_config), name=f"plugin-{plugin_cfg.get('id','?')}"
+            target=entry["runner"],
+            args=(plugin_cfg, bus_config),
+            name=f"plugin-{plugin_cfg.get('id','?')}",
         )
         proc.start()
         plugin_procs.append(proc)
@@ -380,14 +419,20 @@ def start_from_config(config_path: Path, overrides: Dict[str, str]) -> None:
             if shutdown_requested and shutdown_started_at is None:
                 shutdown_started_at = time.monotonic()
                 try:
-                    bus_client.publish(CONTROL_SHUTDOWN_TOPIC, build_envelope("main", CONTROL_SHUTDOWN_TOPIC, {}))
+                    bus_client.publish(
+                        CONTROL_SHUTDOWN_TOPIC,
+                        build_envelope("main", CONTROL_SHUTDOWN_TOPIC, {}),
+                    )
                 except MqttPublishError:
                     pass
             if shutdown_requested:
                 alive = [proc for proc in all_procs if proc.is_alive()]
                 if not alive:
                     break
-                if shutdown_started_at is not None and time.monotonic() - shutdown_started_at > 5.0:
+                if (
+                    shutdown_started_at is not None
+                    and time.monotonic() - shutdown_started_at > 5.0
+                ):
                     for proc in alive:
                         proc.terminate()
                     break
@@ -396,7 +441,10 @@ def start_from_config(config_path: Path, overrides: Dict[str, str]) -> None:
             if not dead:
                 continue
             names = ", ".join(f"{p.name}({p.exitcode})" for p in dead)
-            print(f"[MAIN] detected exit: {names}, terminating remaining", flush=True)
+            print(
+                f"[MAIN] detected exit: {names}, terminating remaining",
+                flush=True,
+            )
             shutdown_requested = True
     except KeyboardInterrupt:
         print("[MAIN] interrupt received, terminating", flush=True)
@@ -404,7 +452,10 @@ def start_from_config(config_path: Path, overrides: Dict[str, str]) -> None:
         alive = [proc for proc in all_procs if proc.is_alive()]
         if alive:
             try:
-                bus_client.publish(CONTROL_SHUTDOWN_TOPIC, build_envelope("main", CONTROL_SHUTDOWN_TOPIC, {}))
+                bus_client.publish(
+                    CONTROL_SHUTDOWN_TOPIC,
+                    build_envelope("main", CONTROL_SHUTDOWN_TOPIC, {}),
+                )
             except MqttPublishError:
                 pass
             deadline = time.monotonic() + 5.0
