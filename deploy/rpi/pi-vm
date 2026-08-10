@@ -5,8 +5,11 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 VM_DIR=${SCRIPT_DIR}/.vm
 DEFAULT_IMAGE=${SCRIPT_DIR}/dist/mpfc-rpi-zero2w.img
 IMAGE=${MPFC_PI_IMAGE:-${DEFAULT_IMAGE}}
-SSH_PORT=${MPFC_PI_SSH_PORT:-2222}
-MAVLINK_PORT=${MPFC_PI_MAVLINK_PORT:-14540}
+CONTROL_IP=${MPFC_CONTROL_IP:-192.168.0.220}
+GUEST_IP=${MPFC_PI_IP:-192.168.0.230}
+PREFIX=${MPFC_PI_PREFIX:-24}
+BRIDGE=${MPFC_PI_BRIDGE:-cfbr0}
+TAP=${MPFC_PI_TAP:-cfmpfc0}
 SSH_KEY=${MPFC_PI_SSH_KEY:-${HOME}/.ssh/id_ed25519}
 
 usage() {
@@ -16,15 +19,18 @@ Usage: ${0##*/} <command> [options]
 Commands:
   up       Run a disposable Pi VM in the foreground
   start    Run it in the background
-  stop     Stop a background VM
-  ssh      SSH to the VM
+  stop     Stop a background VM and remove its private bridge/tap
+  ssh      SSH directly to the guest IP
   logs     Follow mpfc.service logs
-  deploy   Rsync MPFC + sibling OCCID/HiveLink into the running VM and restart
+  deploy   Rsync MPFC + sibling OCCID/HiveLink into the guest and restart
 
 Options used by up/start:
   --image PATH         Appliance raw image, default ${DEFAULT_IMAGE}
-  --ssh-port PORT      Host SSH forward, default ${SSH_PORT}
-  --mavlink-port PORT  Host UDP forward to guest 14540, default ${MAVLINK_PORT}
+  --control-ip IP      Host/control bridge address, default ${CONTROL_IP}
+  --guest-ip IP        Guest address, default ${GUEST_IP}
+  --prefix N           Private network prefix length, default ${PREFIX}
+  --bridge NAME        Linux bridge, default ${BRIDGE}
+  --tap NAME           QEMU tap device, default ${TAP}
   --ssh-key PATH       SSH private key; PATH.pub is injected into the VM
 EOF_USAGE
 }
@@ -36,8 +42,11 @@ shift
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --image) IMAGE=$2; shift 2 ;;
-        --ssh-port) SSH_PORT=$2; shift 2 ;;
-        --mavlink-port) MAVLINK_PORT=$2; shift 2 ;;
+        --control-ip) CONTROL_IP=$2; shift 2 ;;
+        --guest-ip) GUEST_IP=$2; shift 2 ;;
+        --prefix) PREFIX=$2; shift 2 ;;
+        --bridge) BRIDGE=$2; shift 2 ;;
+        --tap) TAP=$2; shift 2 ;;
         --ssh-key) SSH_KEY=$2; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -48,21 +57,69 @@ mkdir -p "${VM_DIR}"
 PID_FILE=${VM_DIR}/qemu.pid
 CFG_IMAGE=${VM_DIR}/mpfc-config.img
 
-ssh_base=(ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -p "${SSH_PORT}")
+sudo_cmd() {
+    if [[ ${EUID} -eq 0 ]]; then
+        "$@"
+    else
+        command -v sudo >/dev/null || { echo "sudo is required to create the QEMU bridge/tap" >&2; exit 1; }
+        sudo "$@"
+    fi
+}
+
+ssh_base=(
+    ssh
+    -o StrictHostKeyChecking=no
+    -o UserKnownHostsFile=/dev/null
+    -o ConnectTimeout=5
+)
 if [[ -f ${SSH_KEY} ]]; then
     ssh_base+=(-i "${SSH_KEY}")
 fi
-ssh_base+=(mpfc@127.0.0.1)
+ssh_base+=("mpfc@${GUEST_IP}")
 
 require_vm_files() {
-    [[ -f ${IMAGE} ]] || { echo "image not found: ${IMAGE}" >&2; echo "build it with: sudo ${SCRIPT_DIR}/build-image" >&2; exit 1; }
+    [[ -f ${IMAGE} ]] || {
+        echo "image not found: ${IMAGE}" >&2
+        echo "build it with: sudo ${SCRIPT_DIR}/build-image" >&2
+        exit 1
+    }
     [[ -f ${IMAGE}.kernel8.img ]] || { echo "QEMU kernel sidecar missing: ${IMAGE}.kernel8.img" >&2; exit 1; }
     [[ -f ${IMAGE}.raspi3ap.dtb ]] || { echo "QEMU DTB sidecar missing: ${IMAGE}.raspi3ap.dtb" >&2; exit 1; }
 }
 
+ensure_network() {
+    command -v ip >/dev/null || { echo "missing host command: ip" >&2; exit 1; }
+
+    if ! ip link show "${BRIDGE}" >/dev/null 2>&1; then
+        sudo_cmd ip link add name "${BRIDGE}" type bridge
+    fi
+    sudo_cmd ip addr replace "${CONTROL_IP}/${PREFIX}" dev "${BRIDGE}"
+    sudo_cmd ip link set "${BRIDGE}" up
+
+    if ip link show "${TAP}" >/dev/null 2>&1; then
+        sudo_cmd ip link del "${TAP}"
+    fi
+    sudo_cmd ip tuntap add dev "${TAP}" mode tap user "$(id -un)"
+    sudo_cmd ip link set "${TAP}" master "${BRIDGE}"
+    sudo_cmd ip link set "${TAP}" up
+}
+
+cleanup_network() {
+    if ip link show "${TAP}" >/dev/null 2>&1; then
+        sudo_cmd ip link del "${TAP}" || true
+    fi
+    if ip link show "${BRIDGE}" >/dev/null 2>&1; then
+        sudo_cmd ip link del "${BRIDGE}" || true
+    fi
+}
+
 make_config_disk() {
     for cmd in truncate mkfs.vfat mcopy; do
-        command -v "${cmd}" >/dev/null || { echo "missing host command: ${cmd}" >&2; echo "install: sudo apt install dosfstools mtools" >&2; exit 1; }
+        command -v "${cmd}" >/dev/null || {
+            echo "missing host command: ${cmd}" >&2
+            echo "install: sudo apt install dosfstools mtools" >&2
+            exit 1
+        }
     done
     rm -f "${CFG_IMAGE}"
     truncate -s 16M "${CFG_IMAGE}"
@@ -102,7 +159,7 @@ if=none,id=mpfccfg,format=raw,file=${CFG_IMAGE},readonly=on
 -device
 usb-storage,drive=mpfccfg
 -netdev
-user,id=net0,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22,hostfwd=udp:127.0.0.1:${MAVLINK_PORT}-:14540
+tap,id=net0,ifname=${TAP},script=no,downscript=no
 -device
 usb-net,netdev=net0
 -nographic
@@ -114,9 +171,15 @@ EOF_ARGS
 run_qemu() {
     local daemonize=$1
     require_vm_files
-    command -v qemu-system-aarch64 >/dev/null || { echo "missing qemu-system-aarch64" >&2; echo "install: sudo apt install qemu-system-arm" >&2; exit 1; }
+    command -v qemu-system-aarch64 >/dev/null || {
+        echo "missing qemu-system-aarch64" >&2
+        echo "install: sudo apt install qemu-system-arm" >&2
+        exit 1
+    }
     make_config_disk
+    ensure_network
     mapfile -t args < <(qemu_args)
+
     if [[ ${daemonize} == 1 ]]; then
         local daemon_args=()
         local i=0
@@ -132,12 +195,16 @@ run_qemu() {
             daemon_args+=("${args[i]}")
             ((i += 1))
         done
-        qemu-system-aarch64 "${daemon_args[@]}" -display none -serial null -monitor none -daemonize -pidfile "${PID_FILE}"
-        echo "MPFC Pi VM started (pid $(cat "${PID_FILE}"), SSH 127.0.0.1:${SSH_PORT}, MAVLink UDP 127.0.0.1:${MAVLINK_PORT})"
-    else
-        echo "MPFC Pi VM: SSH 127.0.0.1:${SSH_PORT}, MAVLink UDP 127.0.0.1:${MAVLINK_PORT} -> guest :14540"
-        exec qemu-system-aarch64 "${args[@]}"
+        qemu-system-aarch64 "${daemon_args[@]}" \
+            -display none -serial null -monitor none \
+            -daemonize -pidfile "${PID_FILE}"
+        echo "MPFC Pi VM started: guest ${GUEST_IP}, control ${CONTROL_IP}, bridge ${BRIDGE}, tap ${TAP}"
+        return
     fi
+
+    echo "MPFC Pi VM: control ${CONTROL_IP} <-> guest ${GUEST_IP} on ${BRIDGE}"
+    trap cleanup_network EXIT INT TERM
+    qemu-system-aarch64 "${args[@]}"
 }
 
 case "${COMMAND}" in
@@ -152,12 +219,18 @@ case "${COMMAND}" in
         run_qemu 1
         ;;
     stop)
-        [[ -f ${PID_FILE} ]] || { echo "VM is not running"; exit 0; }
-        pid=$(cat "${PID_FILE}")
-        if kill -0 "${pid}" 2>/dev/null; then
-            kill "${pid}"
+        if [[ -f ${PID_FILE} ]]; then
+            pid=$(cat "${PID_FILE}")
+            if kill -0 "${pid}" 2>/dev/null; then
+                kill "${pid}"
+                for _ in {1..50}; do
+                    kill -0 "${pid}" 2>/dev/null || break
+                    sleep 0.1
+                done
+            fi
+            rm -f "${PID_FILE}"
         fi
-        rm -f "${PID_FILE}"
+        cleanup_network
         ;;
     ssh)
         exec "${ssh_base[@]}"
@@ -170,13 +243,28 @@ case "${COMMAND}" in
         REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
         OCCID_PATH=$(cd -- "${REPO_ROOT}/.." && pwd)/occid
         HIVELINK_PATH=$(cd -- "${REPO_ROOT}/.." && pwd)/hivelink
-        [[ -d ${OCCID_PATH} && -d ${HIVELINK_PATH} ]] || { echo "expected sibling occid and hivelink checkouts" >&2; exit 1; }
-        RSYNC_SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -p ${SSH_PORT}"
+        [[ -d ${OCCID_PATH} && -d ${HIVELINK_PATH} ]] || {
+            echo "expected sibling occid and hivelink checkouts" >&2
+            exit 1
+        }
+        RSYNC_SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
         [[ -f ${SSH_KEY} ]] && RSYNC_SSH+=" -i ${SSH_KEY}"
-        common_excludes=(--exclude=.git --exclude='__pycache__' --exclude='*.pyc' --exclude='.venv' --exclude='deploy/rpi/.build' --exclude='deploy/rpi/.cache' --exclude='deploy/rpi/dist' --exclude='deploy/rpi/.vm')
-        rsync -az --delete "${common_excludes[@]}" -e "${RSYNC_SSH}" "${REPO_ROOT}/" mpfc@127.0.0.1:/opt/mpfc/
-        rsync -az --delete --exclude=.git --exclude='__pycache__' -e "${RSYNC_SSH}" "${OCCID_PATH}/" mpfc@127.0.0.1:/opt/occid/
-        rsync -az --delete --exclude=.git --exclude='__pycache__' -e "${RSYNC_SSH}" "${HIVELINK_PATH}/" mpfc@127.0.0.1:/opt/hivelink/
+        common_excludes=(
+            --exclude=.git
+            --exclude='__pycache__'
+            --exclude='*.pyc'
+            --exclude='.venv'
+            --exclude='deploy/rpi/.build'
+            --exclude='deploy/rpi/.cache'
+            --exclude='deploy/rpi/dist'
+            --exclude='deploy/rpi/.vm'
+        )
+        rsync -az --delete "${common_excludes[@]}" -e "${RSYNC_SSH}" \
+            "${REPO_ROOT}/" "mpfc@${GUEST_IP}:/opt/mpfc/"
+        rsync -az --delete --exclude=.git --exclude='__pycache__' -e "${RSYNC_SSH}" \
+            "${OCCID_PATH}/" "mpfc@${GUEST_IP}:/opt/occid/"
+        rsync -az --delete --exclude=.git --exclude='__pycache__' -e "${RSYNC_SSH}" \
+            "${HIVELINK_PATH}/" "mpfc@${GUEST_IP}:/opt/hivelink/"
         "${ssh_base[@]}" /opt/mpfc/.venv/bin/pip install -e /opt/hivelink
         "${ssh_base[@]}" sudo /usr/bin/systemctl restart mpfc.service
         ;;
