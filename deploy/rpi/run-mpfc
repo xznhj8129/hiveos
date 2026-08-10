@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""Launch MPFC with the appliance-specific MAVSDK endpoint override."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import yaml
+
+DEFAULT_CONFIG = Path("/opt/mpfc/flight_cores/execution_host/config_appliance.yaml")
+RUNTIME_CONFIG = Path("/run/mpfc/config.yaml")
+DEFAULT_CONNECTION = "serial:///dev/serial0:921600"
+
+
+def main() -> None:
+    source = Path(os.environ.get("MPFC_CONFIG", str(DEFAULT_CONFIG)))
+    connection = os.environ.get("MPFC_MAVLINK_CONNECTION", DEFAULT_CONNECTION).strip()
+    if "://" not in connection:
+        raise SystemExit(f"MPFC_MAVLINK_CONNECTION must be a MAVSDK URL, got {connection!r}")
+
+    with source.open("r", encoding="utf-8") as handle:
+        config = yaml.safe_load(handle)
+
+    found = False
+    for entry in config.get("plugins", []):
+        if entry.get("plugin") != "mavsdk_interface":
+            continue
+        entry.setdefault("cfg", {})["conn_str"] = connection
+        found = True
+
+    if not found:
+        raise SystemExit(f"mavsdk_interface not found in {source}")
+
+    RUNTIME_CONFIG.parent.mkdir(parents=True, exist_ok=True)
+    with RUNTIME_CONFIG.open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(config, handle, sort_keys=False)
+
+    env = os.environ.copy()
+    env["MAIN_CONFIG"] = str(RUNTIME_CONFIG)
+    env.setdefault("OCCID_PATH", "/opt/occid")
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    os.chdir("/opt/mpfc")
+    os.execve("/opt/mpfc/.venv/bin/python", ["python", "/opt/mpfc/main.py"], env)
+
+
+if __name__ == "__main__":
+    main()

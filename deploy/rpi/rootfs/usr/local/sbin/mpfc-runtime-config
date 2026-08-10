@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+RUN_DIR=/run/mpfc
+MOUNT_DIR=${RUN_DIR}/config-media
+LABEL_PATH=/dev/disk/by-label/MPFC_CONFIG
+
+install -d -m 0755 "${RUN_DIR}"
+rm -f "${RUN_DIR}/runtime.env"
+
+# A physical Pi normally has no MPFC_CONFIG volume. Give the QEMU USB storage
+# a short window to appear, then continue immediately with physical defaults.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    [[ -e ${LABEL_PATH} ]] && break
+    sleep 0.2
+done
+
+if [[ ! -e ${LABEL_PATH} ]]; then
+    exit 0
+fi
+
+install -d -m 0755 "${MOUNT_DIR}"
+mount -o ro "${LABEL_PATH}" "${MOUNT_DIR}"
+trap 'umount "${MOUNT_DIR}" 2>/dev/null || true' EXIT
+
+if [[ -f ${MOUNT_DIR}/runtime.env ]]; then
+    install -m 0644 "${MOUNT_DIR}/runtime.env" "${RUN_DIR}/runtime.env"
+fi
+
+if [[ -s ${MOUNT_DIR}/authorized_keys ]]; then
+    install -d -o mpfc -g mpfc -m 0700 /home/mpfc/.ssh
+    install -o mpfc -g mpfc -m 0600 "${MOUNT_DIR}/authorized_keys" /home/mpfc/.ssh/authorized_keys
+fi
