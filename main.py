@@ -17,6 +17,17 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List
 
+# Python 3.14 defaults to the multiprocessing forkserver on POSIX.  The child
+# re-imports this file with the parent's mutated sys.path, where OCCID_PATH may
+# precede MPFC and expose OCCID's unrelated ``lib`` package.  Keep MPFC's own
+# modules authoritative before importing ``lib.common``.
+REPO_ROOT = Path(__file__).resolve().parent
+repo_root_text = str(REPO_ROOT)
+if sys.path[0] != repo_root_text:
+    if repo_root_text in sys.path:
+        sys.path.remove(repo_root_text)
+    sys.path.insert(0, repo_root_text)
+
 from lib.common import CONTROL_SHUTDOWN_TOPIC, build_envelope, connect_bus_client, load_config
 from lib.mqtt_bus_client import MqttPublishError
 from lib.occid_bus import occid
@@ -255,7 +266,7 @@ def configure_runtime_plugins(config: Dict[str, Any], vehicle: Dict[str, str] | 
 
 
 def start_from_config(config_path: Path, overrides: Dict[str, str]) -> None:
-    repo_root = Path(__file__).resolve().parent
+    repo_root = REPO_ROOT
     config = load_config(config_path)
     apply_runtime_overrides(config, overrides)
     apply_plugin_config_templates(config, repo_root)

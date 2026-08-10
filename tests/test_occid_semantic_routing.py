@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import subprocess
+import sys
 import unittest
+from pathlib import Path
 
 from lib.occid_bus import occid
 from lib.uav_client import UavClient
@@ -70,6 +73,28 @@ class UavClientRoutingTests(unittest.TestCase):
         self.assertEqual(self.runtime.wait_calls, [("req-1", 10.0), ("req-2", 10.0)])
         models = [item[1]["data"]["command"]["_occid_model"] for item in self.runtime.bus.published]
         self.assertEqual(models, ["BeginDirectControlCommand", "EndDirectControlCommand"])
+
+
+class RuntimeImportTests(unittest.TestCase):
+    def test_main_prioritizes_mpfc_lib_when_occid_path_is_first(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        occid_root = repo_root.parent / "occid"
+        code = "\n".join(
+            [
+                "import runpy, sys",
+                f"sys.path.insert(0, {str(occid_root)!r})",
+                f"runpy.run_path({str(repo_root / 'main.py')!r}, run_name='mpfc_import_probe')",
+                "import lib.common",
+                f"assert lib.common.__file__.startswith({str(repo_root)!r}), lib.common.__file__",
+            ]
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":
