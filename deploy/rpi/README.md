@@ -1,19 +1,21 @@
 # MPFC Raspberry Pi appliance
 
-This directory defines the reference MPFC companion computer appliance for a
+This directory defines the reference MPFC companion-computer appliance for a
 Raspberry Pi Zero 2 W class target.
 
-The goal is deliberately simple:
+The appliance has two jobs:
 
-1. Build one Raspberry Pi OS Lite 64-bit image that is ready to burn to an SD
+1. Build one Raspberry Pi OS Lite 64-bit image that is ready to write to an SD
    card and run on a real Zero 2 W.
-2. Boot that same raw image immediately in QEMU as a disposable 4-core,
-   512 MiB ARM64 Pi-class VM for PX4/MPFC development.
-3. Keep the source-repository boundary to `mpfc`, `occid`, and `hivelink`.
+2. Boot that same raw image under QEMU as an independently addressed ARM64 node
+   for MPFC/OCCID/HiveLink/PX4 development.
 
-The physical and virtual machines use the same filesystem, packages, services,
-MPFC checkout, OCCID checkout, HiveLink checkout, Python environment, Mosquitto
-configuration, and systemd units. Only the FC transport is overridden:
+The image contains the MPFC, OCCID, and HiveLink source trees, one Python
+environment, a loopback-only Mosquitto broker, and the MPFC systemd runtime.
+The physical and virtual forms differ only in deployment-specific runtime
+configuration such as the FC connection and network provisioning.
+
+Reference FC connections:
 
 ```text
 physical: serial:///dev/<deployment-assigned-tty>:<baud>
@@ -28,10 +30,10 @@ On a Debian/Ubuntu/Mint development machine:
 sudo apt install \
   git curl rsync xz-utils parted e2fsprogs \
   qemu-system-arm qemu-user-static binfmt-support \
-  dosfstools mtools
+  dosfstools mtools iproute2
 ```
 
-Keep the three source repositories as siblings:
+Keep the source repositories as siblings:
 
 ```text
 ~/opt/
@@ -39,8 +41,6 @@ Keep the three source repositories as siblings:
   occid/
   hivelink/
 ```
-
-Alternate OCCID and HiveLink paths can be passed to `build-image`.
 
 ## Build the SD/VM image
 
@@ -73,7 +73,7 @@ sudo ./deploy/rpi/build-image \
   --base-sha256 <sha256>
 ```
 
-Add `--compress` when you also want an `.img.xz` distribution artifact.
+Add `--compress` when an `.img.xz` distribution artifact is also wanted.
 
 The manifest records the base image hash and the MPFC/OCCID/HiveLink revisions
 used for the build.
@@ -87,8 +87,8 @@ sudo dd if=deploy/rpi/dist/mpfc-rpi-zero2w.img \
   of=/dev/sdX bs=4M status=progress conv=fsync
 ```
 
-The default FC endpoint in the image is `/dev/serial0` at 921600 baud. The
-normal deployment procedure should explicitly assign the real FC tty:
+The default physical FC endpoint in the image is `/dev/serial0` at 921600 baud.
+The deployment procedure should explicitly assign the real FC tty:
 
 ```bash
 sudo /opt/mpfc/deploy/rpi/configure-fc /dev/ttyAMA0 921600
@@ -101,10 +101,25 @@ sudo /opt/mpfc/deploy/rpi/configure-fc /dev/ttyUSB0 460800
 ```
 
 `configure-fc` writes `/etc/mpfc/runtime.env`, adds the service user to
-`dialout`, and restarts MPFC. This is the integration point for the broader
-hardware deployment script: pass it the tty that script already selected.
+`dialout`, and restarts MPFC.
+
+Network configuration is a deployment concern. The image includes the reference
+QEMU Ethernet profile used below; a physical installation may replace that
+profile with its actual Ethernet/Wi-Fi configuration without changing MPFC,
+OCCID, or HiveLink semantics.
 
 ## Run the virtual Pi
+
+The reference development network is:
+
+```text
+control host / cfbr0   192.168.0.220/24
+MPFC guest             192.168.0.230/24
+```
+
+`pi-vm` creates a Linux bridge and TAP device, so it requires sudo capability
+for network-device setup. The guest is a real IP peer; there are no localhost
+SSH or MAVLink port-forward shims.
 
 Start a disposable VM in the foreground:
 
@@ -118,30 +133,35 @@ Or daemonize it:
 ./deploy/rpi/pi-vm start
 ```
 
-The VM uses QEMU's `raspi3ap` machine, which matches the Zero 2 W's useful test
-budget closely: four Cortex-A53 cores and 512 MiB RAM. It boots the exact same
-raw SD image with QEMU snapshot mode, so guest writes are discarded when the VM
-stops.
+The VM uses QEMU's `raspi3ap` machine with four Cortex-A53 cores and 512 MiB
+RAM. It boots the exact same raw SD image with QEMU snapshot mode, so guest
+writes are discarded when the VM stops.
 
-The helper creates a tiny removable FAT volume labelled `MPFC_CONFIG`. That
-volume overrides only:
+The helper creates a tiny removable FAT volume labelled `MPFC_CONFIG`. For the
+VM it injects:
 
 ```text
 MPFC_MAVLINK_CONNECTION=udp://:14540
 ```
 
-The base image therefore remains a real-hardware image. There is no separate
-"VM image" to drift out of sync.
+and the selected SSH public key. The base image therefore remains the physical
+artifact rather than having a separate VM fork.
 
-Host mappings are:
+The two independent server-to-Pi paths are:
 
 ```text
-127.0.0.1:2222/tcp  -> guest :22/tcp    SSH
-127.0.0.1:14540/udp -> guest :14540/udp PX4 companion MAVLink
+Sigma/control 192.168.0.220:5555
+    -> HiveLink/OCCID UDP
+    -> MPFC Pi 192.168.0.230:5555
+
+PX4 SITL onboard MAVLink
+    -> cfbr0 broadcast, remote UDP 14540
+    -> MAVSDK inside MPFC Pi
 ```
 
-Point PX4 SITL's companion output at host UDP port 14540. Inside the VM,
-`mavsdk_interface` receives it exactly as an external companion endpoint.
+With PX4 POSIX SITL, setting `PX4_NET_INTERFACE=cfbr0` causes its normal onboard
+MAVLink instance to bind the bridge interface and enable broadcast. No MAVLink
+relay is required.
 
 Useful commands:
 
@@ -153,10 +173,10 @@ Useful commands:
 ```
 
 `deploy` rsyncs the current MPFC checkout and sibling OCCID/HiveLink checkouts
-into the running guest and restarts MPFC. Rebuilding the SD image is therefore
-not required for ordinary Python development.
+into the running guest, reinstalls the editable HiveLink package, and restarts
+MPFC. Rebuilding the SD image is not required for ordinary Python iteration.
 
-The VM injects `$HOME/.ssh/id_ed25519.pub` by default. Override it with:
+The VM injects `$HOME/.ssh/id_ed25519.pub` by default. Use another identity with:
 
 ```bash
 MPFC_PI_SSH_KEY=$HOME/.ssh/another_key ./deploy/rpi/pi-vm start
@@ -182,22 +202,27 @@ mpfc-runtime-config.service
 mpfc.service
 ```
 
+Mosquitto listens only on `127.0.0.1:1883`. It is MPFC's private node-local
+IPC and is not the external autonomous-node API.
+
 Watch MPFC directly on either real or virtual hardware:
 
 ```bash
 journalctl -fu mpfc.service
 ```
 
-Watch the local MQTT/OCCID bus:
+Watch the private node-local bus:
 
 ```bash
 mosquitto_sub -h 127.0.0.1 -p 1883 -v -t 'mpfc/#'
 ```
 
-## Known boundary
+## Validation boundary
 
-This VM is intended to prove the companion-computer deployment: ARM64 package
-availability, Python/MAVSDK behavior, 512 MiB memory pressure, service startup,
-MQTT, OCCID, HiveLink, networking, and PX4 interaction. It does not pretend to
-validate Zero 2 W GPIO, Wi-Fi, Bluetooth, electrical behavior, or timing of
-physical serial hardware.
+The VM is intended to validate the companion-computer deployment boundary:
+ARM64 package availability, Python/MAVSDK behavior, 512 MiB memory pressure,
+service startup, private local IPC, OCCID, HiveLink, independent IP networking,
+and PX4 interaction.
+
+It does not validate Zero 2 W GPIO, Wi-Fi/Bluetooth RF behavior, electrical
+behavior, or timing characteristics of physical serial hardware.
