@@ -46,7 +46,6 @@ plugins:
     id: mavsdk
     topic_ns: UAV
     is_interface: true
-    conn_type: udp
     conn_str: udp://:14540
     mav_dialect: PX4
     mav_type: MAV_TYPE_QUADROTOR
