@@ -24,6 +24,24 @@
         "value": "value to set"
       }
     },
+    "OCCID/IN": {
+      "direction": "hivelink_interface -> local consumers",
+      "summary": "Canonical OCCID model received from a remote HiveLink node. Node-local bridge topic only.",
+      "data": {
+        "source": "HiveLink source node id",
+        "interface": "Local HiveLink bearer that received the model",
+        "received_at": "Unix epoch seconds",
+        "model": "lib.occid_bus pack_occid() representation"
+      }
+    },
+    "OCCID/OUT": {
+      "direction": "local consumers -> hivelink_interface",
+      "summary": "Canonical OCCID model for delivery to a remote HiveLink node. Node-local bridge topic only.",
+      "data": {
+        "dest": "HiveLink destination node id",
+        "model": "lib.occid_bus pack_occid() representation"
+      }
+    },
     "<client_id>/<topic_ns>/REQUEST": {
       "direction": "any -> interface",
       "summary": "Requests for interface actions (actual runtime topic)",
