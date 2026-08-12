@@ -58,6 +58,7 @@ mkdir -p "${VM_DIR}"
 PID_FILE=${VM_DIR}/qemu.pid
 CFG_IMAGE=${VM_DIR}/mpfc-config.img
 CONSOLE_LOG=${VM_DIR}/console.log
+QEMU_DTB=${VM_DIR}/raspi3ap-qemu.dtb
 
 sudo_cmd() {
     if [[ ${EUID} -eq 0 ]]; then
@@ -149,6 +150,44 @@ EOF_ENV
     fi
 }
 
+make_qemu_dtb() {
+    local cmd node compatible
+    local found=0
+
+    for cmd in fdtget fdtput; do
+        command -v "${cmd}" >/dev/null || {
+            echo "missing host command: ${cmd}" >&2
+            echo "install: sudo apt install device-tree-compiler" >&2
+            exit 1
+        }
+    done
+
+    # Modern Raspberry Pi kernels expose the real BCM2835 PM block, including
+    # its ASB register range, through the Pi 3 DTB. QEMU's raspi3 model does not
+    # faithfully provide that block; probing bcm2835-power can therefore raise
+    # a synchronous external abort before userspace starts. The raw appliance
+    # and its original DTB remain physical-hardware artifacts. Patch only a
+    # throwaway QEMU copy and disable the unsupported PM/watchdog provider.
+    cp "${IMAGE}.raspi3ap.dtb" "${QEMU_DTB}"
+    while IFS= read -r node; do
+        [[ -n ${node} ]] || continue
+        compatible=$(fdtget -t s "${QEMU_DTB}" "/soc/${node}" compatible 2>/dev/null || true)
+        case " ${compatible} " in
+            *" brcm,bcm2835-pm "*|*" brcm,bcm2835-pm-wdt "*)
+                fdtput -t s "${QEMU_DTB}" "/soc/${node}" status disabled
+                echo "QEMU DTB: disabled unsupported /soc/${node} (${compatible})"
+                found=1
+                break
+                ;;
+        esac
+    done < <(fdtget -l "${QEMU_DTB}" /soc)
+
+    if [[ ${found} -ne 1 ]]; then
+        echo "unable to find BCM2835 PM/watchdog node in QEMU DTB" >&2
+        exit 1
+    fi
+}
+
 qemu_args() {
     cat <<EOF_ARGS
 -M
@@ -162,7 +201,7 @@ cortex-a53
 -kernel
 ${IMAGE}.kernel8.img
 -dtb
-${IMAGE}.raspi3ap.dtb
+${QEMU_DTB}
 -append
 rw earlyprintk loglevel=8 console=ttyAMA1,115200 dwc_otg.lpm_enable=0 root=/dev/mmcblk0p2 rootfstype=ext4 rootdelay=1 rootwait fsck.repair=yes net.ifnames=0
 -drive
@@ -191,6 +230,7 @@ run_qemu() {
         exit 1
     }
     make_config_disk
+    make_qemu_dtb
     ensure_network
     mapfile -t args < <(qemu_args)
 
