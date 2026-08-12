@@ -26,6 +26,7 @@ Commands:
   up       Run a disposable Pi VM in the foreground
   start    Run it in the background
   stop     Stop a background VM and remove its bridge/tap
+  console  Follow the background VM serial console
   ssh      SSH directly to ${GUEST_IP}
   logs     Follow mpfc.service logs
   deploy   Rsync MPFC + sibling OCCID/HiveLink into the guest and restart
@@ -56,6 +57,7 @@ done
 mkdir -p "${VM_DIR}"
 PID_FILE=${VM_DIR}/qemu.pid
 CFG_IMAGE=${VM_DIR}/mpfc-config.img
+CONSOLE_LOG=${VM_DIR}/console.log
 
 sudo_cmd() {
     if [[ ${EUID} -eq 0 ]]; then
@@ -162,7 +164,7 @@ ${IMAGE}.kernel8.img
 -dtb
 ${IMAGE}.raspi3ap.dtb
 -append
-rw console=ttyAMA1,115200 root=/dev/mmcblk0p2 rootfstype=ext4 rootwait fsck.repair=yes net.ifnames=0
+rw earlyprintk loglevel=8 console=ttyAMA1,115200 dwc_otg.lpm_enable=0 root=/dev/mmcblk0p2 rootfstype=ext4 rootdelay=1 rootwait fsck.repair=yes net.ifnames=0
 -drive
 file=${IMAGE},format=raw,if=sd,index=0,snapshot=on
 -usb
@@ -207,10 +209,12 @@ run_qemu() {
             daemon_args+=("${args[i]}")
             ((i += 1))
         done
+        rm -f "${CONSOLE_LOG}"
         qemu-system-aarch64 "${daemon_args[@]}" \
-            -display none -serial null -monitor none \
+            -display none -serial "file:${CONSOLE_LOG}" -monitor none \
             -daemonize -pidfile "${PID_FILE}"
         echo "MPFC Pi VM started: control ${CONTROL_IP} <-> guest ${GUEST_IP}"
+        echo "Serial console: ${CONSOLE_LOG}"
         return
     fi
 
@@ -243,6 +247,10 @@ case "${COMMAND}" in
             rm -f "${PID_FILE}"
         fi
         cleanup_network
+        ;;
+    console)
+        touch "${CONSOLE_LOG}"
+        exec tail -n 200 -F "${CONSOLE_LOG}"
         ;;
     ssh)
         exec "${ssh_base[@]}"
