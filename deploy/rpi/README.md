@@ -3,9 +3,31 @@
 This directory builds the MPFC companion-computer appliance for a Raspberry Pi
 Zero 2 W class target and boots the same raw image under QEMU for development.
 
-The image contains MPFC, OCCID, HiveLink, one Python environment, a loopback-only
-Mosquitto broker, and the MPFC systemd runtime. It is not part of Sigma's host
-installation and does not require Sigma to build or run.
+The image contains MPFC, OCCID, HiveLink, a Python runtime, loopback-only
+Mosquitto, SSH, and the MPFC systemd runtime. It is independent of Sigma.
+
+## Build model
+
+The appliance build is layered so normal development does not repeatedly run
+package installation under ARM emulation.
+
+1. A pinned Raspberry Pi OS Lite ARM64 image is expanded and provisioned with
+   the small system/runtime package set. This prepared OS layer is cached by the
+   base-image hash, image size, and `install-rootfs` content.
+2. MPFC/HiveLink Python dependencies that have ARM64 wheels are resolved and
+   installed by host x86 Python/pip using explicit target platform, Python, and
+   ABI selectors. The resulting target `site-packages` layer is cached by the
+   resolved requirements inputs.
+3. `crcmod` is supplied by the Debian ARM64 `python3-crcmod` package because it
+   contains a target-native extension.
+4. MPFC, OCCID, HiveLink, service files, identity, password, network settings,
+   and runtime configuration are host-side overlays onto the prepared image.
+5. QEMU system emulation is used for runtime acceptance, not routine Python
+   dependency installation.
+
+`MPFC_BUILD_CACHE` may point at a persistent cache outside the source checkout.
+Sigmac3 defaults this to `~/.cache/sigmac3/mpfc`, so deleting/recloning the MPFC
+deployment root does not gratuitously repeat unchanged dependency work.
 
 ## Configuration
 
@@ -15,47 +37,57 @@ Standalone defaults live in:
 deploy/rpi/defaults.env
 ```
 
-They define the appliance node identity, control-node address, guest address,
-network prefix, HiveLink port, bridge/tap names, and physical/VM MAVLink
-connections. A deployment manager may override those variables in the
-environment before invoking `build-image` or `pi-vm`.
+They define node identity, control/guest addresses, network prefix, HiveLink
+port, bridge/tap names, physical/VM MAVLink connections, and the appliance
+password.
 
-Runtime configuration is generated rather than checked into the rootfs tree:
+Default login:
 
-- `install-rootfs` writes `/etc/mpfc/runtime.env` and the QEMU Ethernet profile
-  from the resolved build settings;
-- `pi-vm` injects VM-only overrides on the removable `MPFC_CONFIG` disk;
-- `run-mpfc` renders the final `/run/mpfc/config.yaml`, including node identity,
-  HiveLink addressing, and MAVSDK connection, immediately before MPFC starts.
+```text
+user:     mpfc
+password: mpfc
+```
+
+Override `MPFC_PI_PASSWORD` before building/booting when another appliance
+password is desired. Password authentication is deliberate; the appliance does
+not depend on a developer's personal SSH key.
+
+At runtime:
+
+- `/etc/mpfc/runtime.env` contains physical/default appliance settings;
+- QEMU supplies VM-only settings on the removable `MPFC_CONFIG` disk;
+- `run-mpfc` renders `/run/mpfc/config.yaml` immediately before MPFC starts.
+
+The image is provisioned before first boot. Raspberry Pi OS `userconfig.service`
+and the unused `systemd-networkd-wait-online.service` are masked in the prepared
+system layer.
 
 ## Host prerequisites
 
 On Debian, Ubuntu, or Mint:
 
 ```bash
-sudo apt install \
-  git curl rsync xz-utils parted e2fsprogs \
-  qemu-system-arm qemu-user-static binfmt-support \
-  dosfstools mtools iproute2
+sudo apt update
+sudo apt install -y \
+  git curl python3 python3-venv python3-pip openssl \
+  rsync xz-utils parted e2fsprogs \
+  qemu-user-static binfmt-support qemu-system-arm \
+  dosfstools mtools device-tree-compiler \
+  iproute2 openssh-client sshpass iputils-ping
 ```
 
-Keep the three image source repositories as siblings when using MPFC directly:
-
-```text
-~/opt/
-  mpfc/
-  occid/
-  hivelink/
-```
+The first prepared-system cache miss uses `qemu-aarch64-static` only for the
+small target OS provisioning step. ARM `pip` is not used.
 
 ## Build the image
+
+Keep MPFC, OCCID, and HiveLink as sibling checkouts, then run:
 
 ```bash
 sudo ./deploy/rpi/build-image
 ```
 
-The builder uses a pinned Raspberry Pi OS Lite 64-bit base image and verifies
-its SHA256. Outputs are written under `deploy/rpi/dist/`:
+Outputs under `deploy/rpi/dist/`:
 
 ```text
 mpfc-rpi-zero2w.img
@@ -65,25 +97,16 @@ mpfc-rpi-zero2w.img.kernel8.img
 mpfc-rpi-zero2w.img.raspi3ap.dtb
 ```
 
-The raw `.img` is the physical SD-card artifact. The kernel and DTB sidecars are
-only for QEMU direct boot.
+The manifest records the base image, prepared-system cache key, Python-layer
+cache key, target Python version, source revisions, node/network settings,
+MAVLink defaults, and password-auth login mode.
 
-When `MPFC_PI_SSH_KEY` names a private key and the matching `.pub` file exists,
-the builder installs that public key into `/home/mpfc/.ssh/authorized_keys` in
-the raw image. Sigmac3 supplies its configured MPFC SSH identity when it builds
-the appliance. A standalone build without a key is allowed but emits a warning.
-
-The manifest records the Raspberry Pi OS base hash, MPFC/OCCID/HiveLink source
-revisions, node names, IP addresses, prefix, HiveLink port, physical/VM MAVLink
-defaults, and the installed SSH public-key hash when one was supplied.
-
-A deployment manager can therefore detect that an existing image is stale
-instead of silently running an appliance built from different sources or
-network settings.
+A source-only rebuild reuses the prepared system/Python layers when their inputs
+have not changed.
 
 ## Physical Pi
 
-Write the image with Raspberry Pi Imager or another raw image writer. For
+Write the raw image with Raspberry Pi Imager or another raw image writer, for
 example:
 
 ```bash
@@ -91,7 +114,7 @@ sudo dd if=deploy/rpi/dist/mpfc-rpi-zero2w.img \
   of=/dev/sdX bs=4M status=progress conv=fsync
 ```
 
-After booting the physical Pi, assign the actual flight-controller serial port:
+After boot, configure the actual FC serial endpoint:
 
 ```bash
 sudo /opt/mpfc/deploy/rpi/configure-fc /dev/ttyAMA0 921600
@@ -103,33 +126,31 @@ or:
 sudo /opt/mpfc/deploy/rpi/configure-fc /dev/ttyUSB0 460800
 ```
 
-`configure-fc` changes only `MPFC_MAVLINK_CONNECTION`. It preserves the node
-identity and network configuration built into `/etc/mpfc/runtime.env`.
-
-Physical network provisioning remains a deployment concern. The QEMU Ethernet
-profile generated into the image exists for the virtual test article and may be
-replaced by the real vehicle's Ethernet or Wi-Fi configuration.
+`configure-fc` changes only `MPFC_MAVLINK_CONNECTION`.
 
 ## Virtual appliance
 
-Start the same image in the foreground:
+Foreground:
 
 ```bash
 ./deploy/rpi/pi-vm up
 ```
 
-or in the background:
+Background:
 
 ```bash
 ./deploy/rpi/pi-vm start
 ```
 
-`pi-vm` creates the configured Linux bridge and TAP device. The guest is an
-independently addressed IP node, not a localhost port-forward shim. QEMU boots
-the raw image in snapshot mode, so VM writes are discarded on stop.
+The host bridge owns only its `/32` control address and one explicit `/32` route
+to the guest, so it never claims the physical LAN prefix.
 
-The `MPFC_CONFIG` disk supplies the configured VM MAVLink endpoint, node/link
-settings, and SSH public key. The base image remains the same physical artifact.
+QEMU uses a disposable DTB copy that disables the BCM2835 PM/watchdog provider
+which current Raspberry Pi kernels probe but QEMU's Pi 3 PM/ASB model does not
+fully implement. The physical image and original DTB remain unchanged.
+
+The VM uses snapshot mode, so guest writes are discarded on stop. The serial
+console is retained at `deploy/rpi/.vm/console.log`.
 
 Useful commands:
 
@@ -140,24 +161,18 @@ Useful commands:
 ./deploy/rpi/pi-vm stop
 ```
 
-`deploy` rsyncs the current MPFC checkout and sibling OCCID/HiveLink checkouts
-into a running guest for fast Python iteration and restarts MPFC. Rebuild the
-image when validating the actual appliance artifact.
+`ssh`, `logs`, and `deploy` use `MPFC_PI_PASSWORD` through `sshpass`; they do not
+read personal SSH keys.
 
-Use another SSH identity with:
-
-```bash
-MPFC_PI_SSH_KEY=$HOME/.ssh/another_key ./deploy/rpi/pi-vm start
-```
+`deploy` is for source-only iteration. It rsyncs MPFC/OCCID/HiveLink and restarts
+MPFC without running target pip. If dependency inputs change, rebuild the image
+so the corresponding cached dependency layer is regenerated.
 
 ## PX4 testing
 
-PX4 SITL is a test peer for MPFC/MAVSDK. It is deliberately not installed or
-started by the MPFC image itself. A higher-level development manager may start
-PX4 on the control host and point its onboard MAVLink stream at the appliance's
-configured VM endpoint.
-
-No MAVLink relay is required for the bridged QEMU setup.
+PX4 SITL is a test peer for MPFC/MAVSDK and is not installed in the appliance.
+A development manager may launch PX4 on the control host while QEMU boots and
+then validate MPFC against the ready peer.
 
 ## Guest services
 
@@ -170,7 +185,7 @@ mpfc.service
 
 Mosquitto listens only on loopback and remains private MPFC node-local IPC.
 
-Useful diagnostics on the guest:
+Useful diagnostics:
 
 ```bash
 journalctl -fu mpfc.service
@@ -179,9 +194,7 @@ mosquitto_sub -h 127.0.0.1 -p 1883 -v -t 'mpfc/#'
 
 ## Validation boundary
 
-The VM validates the companion-computer deployment boundary: ARM64 packages,
-Python/MAVSDK behavior, service startup, private local IPC, OCCID, HiveLink,
-independent IP networking, and PX4 interaction.
-
-It does not validate Zero 2 W GPIO, RF behavior, electrical behavior, or timing
-characteristics of physical serial hardware.
+The VM validates the ARM64 userspace, cross-staged Python/MAVSDK runtime,
+systemd services, private local IPC, OCCID, HiveLink, independent IP networking,
+and PX4 interaction. It does not validate physical Zero 2 W GPIO, RF,
+electrical behavior, or serial timing.
