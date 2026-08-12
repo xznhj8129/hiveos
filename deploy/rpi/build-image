@@ -6,7 +6,7 @@ REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
 # shellcheck source=defaults.env
 source "${SCRIPT_DIR}/defaults.env"
 WORK_ROOT=${SCRIPT_DIR}/.build
-CACHE_ROOT=${SCRIPT_DIR}/.cache
+CACHE_ROOT=${MPFC_BUILD_CACHE:-${SCRIPT_DIR}/.cache}
 DIST_ROOT=${SCRIPT_DIR}/dist
 
 # Pinned Raspberry Pi OS Lite 64-bit release, 18 Jun 2026.
