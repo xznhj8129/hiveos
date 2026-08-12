@@ -28,8 +28,3 @@ trap 'umount "${MOUNT_DIR}" 2>/dev/null || true' EXIT
 if [[ -f ${MOUNT_DIR}/runtime.env ]]; then
     install -m 0644 "${MOUNT_DIR}/runtime.env" "${RUN_DIR}/runtime.env"
 fi
-
-if [[ -s ${MOUNT_DIR}/authorized_keys ]]; then
-    install -d -o mpfc -g mpfc -m 0700 /home/mpfc/.ssh
-    install -o mpfc -g mpfc -m 0600 "${MOUNT_DIR}/authorized_keys" /home/mpfc/.ssh/authorized_keys
-fi
