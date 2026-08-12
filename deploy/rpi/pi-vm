@@ -2,21 +2,23 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=defaults.env
+source "${SCRIPT_DIR}/defaults.env"
 VM_DIR=${SCRIPT_DIR}/.vm
 DEFAULT_IMAGE=${SCRIPT_DIR}/dist/mpfc-rpi-zero2w.img
 IMAGE=${MPFC_PI_IMAGE:-${DEFAULT_IMAGE}}
-CONTROL_IP=192.168.0.220
-GUEST_IP=192.168.0.230
-PREFIX=24
-BRIDGE=${MPFC_PI_BRIDGE:-cfbr0}
-TAP=${MPFC_PI_TAP:-cfmpfc0}
+CONTROL_IP=${MPFC_PI_CONTROL_IP}
+GUEST_IP=${MPFC_PI_GUEST_IP}
+PREFIX=${MPFC_PI_PREFIX}
+BRIDGE=${MPFC_PI_BRIDGE}
+TAP=${MPFC_PI_TAP}
 SSH_KEY=${MPFC_PI_SSH_KEY:-${HOME}/.ssh/id_ed25519}
 
 usage() {
     cat <<EOF_USAGE
 Usage: ${0##*/} <command> [options]
 
-Reference network:
+Configured network:
   control host  ${CONTROL_IP}/${PREFIX}
   MPFC guest    ${GUEST_IP}/${PREFIX}
 
@@ -123,7 +125,11 @@ make_config_disk() {
     truncate -s 16M "${CFG_IMAGE}"
     mkfs.vfat -n MPFC_CONFIG "${CFG_IMAGE}" >/dev/null
     cat > "${VM_DIR}/runtime.env" <<EOF_ENV
-MPFC_MAVLINK_CONNECTION=udp://:14540
+MPFC_NODE_NAME=${MPFC_NODE_NAME}
+MPFC_CONTROL_NODE=${MPFC_CONTROL_NODE}
+MPFC_CONTROL_HOST=${CONTROL_IP}
+MPFC_HIVELINK_PORT=${MPFC_HIVELINK_PORT}
+MPFC_MAVLINK_CONNECTION=${MPFC_PI_VM_MAVLINK_CONNECTION}
 EOF_ENV
     mcopy -o -i "${CFG_IMAGE}" "${VM_DIR}/runtime.env" ::runtime.env
     if [[ -f ${SSH_KEY}.pub ]]; then
