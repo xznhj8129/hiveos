@@ -9,7 +9,7 @@ DEFAULT_IMAGE=${SCRIPT_DIR}/dist/mpfc-rpi-zero2w.img
 IMAGE=${MPFC_PI_IMAGE:-${DEFAULT_IMAGE}}
 CONTROL_IP=${MPFC_PI_CONTROL_IP}
 GUEST_IP=${MPFC_PI_GUEST_IP}
-PREFIX=${MPFC_PI_PREFIX}
+GUEST_PREFIX=${MPFC_PI_PREFIX}
 BRIDGE=${MPFC_PI_BRIDGE}
 TAP=${MPFC_PI_TAP}
 SSH_KEY=${MPFC_PI_SSH_KEY:-${HOME}/.ssh/id_ed25519}
@@ -19,8 +19,8 @@ usage() {
 Usage: ${0##*/} <command> [options]
 
 Configured network:
-  control host  ${CONTROL_IP}/${PREFIX}
-  MPFC guest    ${GUEST_IP}/${PREFIX}
+  control host  ${CONTROL_IP}/32 (host-only VM route)
+  MPFC guest    ${GUEST_IP}/${GUEST_PREFIX}
 
 Commands:
   up       Run a disposable Pi VM in the foreground
@@ -93,7 +93,14 @@ ensure_network() {
     if ! ip link show "${BRIDGE}" >/dev/null 2>&1; then
         sudo_cmd ip link add name "${BRIDGE}" type bridge
     fi
-    sudo_cmd ip addr replace "${CONTROL_IP}/${PREFIX}" dev "${BRIDGE}"
+
+    # Never install the guest's LAN prefix on the host bridge. The configured
+    # appliance addresses may deliberately mirror a physical deployment on the
+    # host's real LAN. Claiming that whole prefix here would install a competing
+    # connected route and blackhole the host's physical LAN. Keep the bridge
+    # host-only and route exactly one guest address into the tap instead.
+    sudo_cmd ip addr flush dev "${BRIDGE}" scope global
+    sudo_cmd ip addr add "${CONTROL_IP}/32" dev "${BRIDGE}"
     sudo_cmd ip link set "${BRIDGE}" up
 
     if ip link show "${TAP}" >/dev/null 2>&1; then
@@ -102,6 +109,7 @@ ensure_network() {
     sudo_cmd ip tuntap add dev "${TAP}" mode tap user "$(id -un)"
     sudo_cmd ip link set "${TAP}" master "${BRIDGE}"
     sudo_cmd ip link set "${TAP}" up
+    sudo_cmd ip route replace "${GUEST_IP}/32" dev "${BRIDGE}" src "${CONTROL_IP}"
 }
 
 cleanup_network() {
