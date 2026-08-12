@@ -1,4 +1,7 @@
-my_name: uav1
+# Runtime-neutral appliance base configuration.
+# deploy/rpi/run-mpfc injects node identity, HiveLink addressing and the
+# concrete MAVSDK connection from /etc/mpfc/runtime.env plus VM overrides.
+my_name: appliance
 
 vehicle:
   autopilot: AutopilotType.PX4
@@ -23,12 +26,8 @@ plugins:
 - plugin: hivelink_interface
   cfg:
     link_config:
-      my_name: uav1
-      nodemap:
-        control:
-          ip:
-          - 192.168.0.220
-          - 5555
+      my_name: appliance
+      nodemap: {}
 
 - plugin: execution_ingress
   cfg:
@@ -53,8 +52,7 @@ plugins:
     id: mavsdk
     topic_ns: UAV
     is_interface: true
-    # deploy/rpi/run-mpfc replaces this URL from MPFC_MAVLINK_CONNECTION.
-    conn_str: serial:///dev/serial0:921600
+    conn_str: runtime://required
     mav_dialect: PX4
     mav_type: MAV_TYPE_QUADROTOR
     mav_sysid: 1
