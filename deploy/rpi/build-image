@@ -28,7 +28,9 @@ usage() {
 Usage: sudo ${0##*/} [options]
 
 Appliance/network defaults come from deploy/rpi/defaults.env. They may be
-overridden in the environment before invoking this builder.
+overridden in the environment before invoking this builder. If
+MPFC_PI_SSH_KEY points to a private key and PATH.pub exists, that public key is
+installed for the mpfc user in the physical image.
 
 Options:
   --base-image PATH     Use an already downloaded .img or .img.xz
@@ -173,6 +175,17 @@ export MPFC_PI_CONTROL_IP MPFC_PI_GUEST_IP MPFC_PI_PREFIX
 export MPFC_HIVELINK_PORT MPFC_NODE_NAME MPFC_CONTROL_NODE
 export MPFC_PI_VM_MAVLINK_CONNECTION MPFC_PI_PHYSICAL_MAVLINK_CONNECTION
 chroot "${ROOT_MNT}" /bin/bash /opt/mpfc/deploy/rpi/install-rootfs
+
+SSH_PUBLIC_KEY_SHA256=none
+if [[ -n ${MPFC_PI_SSH_KEY:-} && -f ${MPFC_PI_SSH_KEY}.pub ]]; then
+    chroot "${ROOT_MNT}" install -d -o mpfc -g mpfc -m 0700 /home/mpfc/.ssh
+    install -m 0600 "${MPFC_PI_SSH_KEY}.pub" "${ROOT_MNT}/home/mpfc/.ssh/authorized_keys"
+    chroot "${ROOT_MNT}" chown mpfc:mpfc /home/mpfc/.ssh/authorized_keys
+    SSH_PUBLIC_KEY_SHA256=$(sha256sum "${MPFC_PI_SSH_KEY}.pub" | awk '{print $1}')
+else
+    echo "warning: MPFC_PI_SSH_KEY.pub was not provided; physical image has no preinstalled SSH key" >&2
+fi
+
 rm -f "${ROOT_MNT}/usr/bin/qemu-aarch64-static"
 rm -f "${ROOT_MNT}/etc/resolv.conf"
 if [[ -e ${WORK_ROOT}/resolv.conf.image || -L ${WORK_ROOT}/resolv.conf.image ]]; then
@@ -219,6 +232,7 @@ network_prefix=${MPFC_PI_PREFIX}
 hivelink_port=${MPFC_HIVELINK_PORT}
 physical_mavlink_default=${MPFC_PI_PHYSICAL_MAVLINK_CONNECTION}
 vm_mavlink_default=${MPFC_PI_VM_MAVLINK_CONNECTION}
+ssh_public_key_sha256=${SSH_PUBLIC_KEY_SHA256}
 EOF_MANIFEST
 sha256sum "${OUTPUT}" > "${OUTPUT}.sha256"
 
