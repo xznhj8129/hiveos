@@ -27,10 +27,11 @@ usage() {
     cat <<EOF_USAGE
 Usage: sudo ${0##*/} [options]
 
-Appliance/network defaults come from deploy/rpi/defaults.env. They may be
-overridden in the environment before invoking this builder. If
-MPFC_PI_SSH_KEY points to a private key and PATH.pub exists, that public key is
-installed for the mpfc user in the physical image.
+Build model:
+  1. prepare/cache the Raspberry Pi OS + system package layer once;
+  2. cross-stage ARM64 Python wheels on the x86 host;
+  3. overlay MPFC/OCCID/HiveLink and configuration with host rsync;
+  4. use QEMU system emulation only for runtime acceptance.
 
 Options:
   --base-image PATH     Use an already downloaded .img or .img.xz
@@ -61,31 +62,26 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ${EUID} -ne 0 ]]; then
-    echo "build-image needs root for loop mounts and ARM64 chrooting" >&2
+    echo "build-image needs root for loop-mounted raw images" >&2
     exit 1
 fi
 
-for cmd in curl xz sha256sum losetup mount umount mountpoint rsync chroot truncate realpath git parted e2fsck resize2fs; do
+for cmd in curl xz sha256sum losetup mount umount mountpoint rsync truncate realpath git parted e2fsck resize2fs openssl python3 awk sed find cp sync; do
     command -v "${cmd}" >/dev/null || { echo "missing host command: ${cmd}" >&2; exit 1; }
 done
-if [[ ! -x /usr/bin/qemu-aarch64-static ]]; then
-    echo "missing /usr/bin/qemu-aarch64-static" >&2
-    echo "install host prerequisites: sudo apt install qemu-user-static binfmt-support" >&2
+python3 -m pip --version >/dev/null 2>&1 || {
+    echo "host python3-pip is required for ARM64 wheel staging" >&2
     exit 1
-fi
-if [[ ! -r /proc/sys/fs/binfmt_misc/qemu-aarch64 ]]; then
-    echo "qemu-aarch64 binfmt handler is not registered" >&2
-    echo "install/enable: sudo apt install qemu-user-static binfmt-support" >&2
-    exit 1
-fi
+}
 
 for path in "${REPO_ROOT}" "${OCCID_PATH}" "${HIVELINK_PATH}"; do
     [[ -d ${path} ]] || { echo "missing source checkout: ${path}" >&2; exit 1; }
 done
 [[ -f ${OCCID_PATH}/occid/__init__.py ]] || { echo "OCCID_PATH does not look like the OCCID repository: ${OCCID_PATH}" >&2; exit 1; }
 [[ -f ${HIVELINK_PATH}/setup.py ]] || { echo "HIVELINK_PATH does not look like the HiveLink repository: ${HIVELINK_PATH}" >&2; exit 1; }
+[[ -f ${REPO_ROOT}/requirements-runtime.txt ]] || { echo "missing MPFC runtime requirements" >&2; exit 1; }
 
-mkdir -p "${WORK_ROOT}" "${CACHE_ROOT}" "$(dirname -- "${OUTPUT}")"
+mkdir -p "${WORK_ROOT}" "${CACHE_ROOT}" "${DIST_ROOT}" "$(dirname -- "${OUTPUT}")"
 rm -rf "${WORK_ROOT:?}"/*
 
 if [[ -z ${BASE_IMAGE} ]]; then
@@ -105,22 +101,10 @@ if [[ -n ${BASE_SHA256} && ${actual_sha} != ${BASE_SHA256} ]]; then
     exit 1
 fi
 
-WORK_IMAGE=${WORK_ROOT}/root.img
-case "${BASE_IMAGE}" in
-    *.xz) xz -dc "${BASE_IMAGE}" > "${WORK_IMAGE}" ;;
-    *) cp --reflink=auto "${BASE_IMAGE}" "${WORK_IMAGE}" ;;
-esac
-
-# QEMU's Raspberry Pi SD model wants a power-of-two card size. Actually grow
-# partition 2 and its ext4 filesystem too; merely truncating the file would not
-# give apt/pip any additional space during the image build.
-truncate -s "${IMAGE_SIZE}" "${WORK_IMAGE}"
-parted -s "${WORK_IMAGE}" resizepart 2 100%
-
 LOOP=
 ROOT_MNT=${WORK_ROOT}/root
 BOOT_MNT=${ROOT_MNT}/boot/firmware
-cleanup() {
+cleanup_mounts() {
     set +e
     mountpoint -q "${ROOT_MNT}/dev/pts" && umount "${ROOT_MNT}/dev/pts"
     mountpoint -q "${ROOT_MNT}/dev" && umount "${ROOT_MNT}/dev"
@@ -129,84 +113,234 @@ cleanup() {
     mountpoint -q "${BOOT_MNT}" && umount "${BOOT_MNT}"
     mountpoint -q "${ROOT_MNT}" && umount "${ROOT_MNT}"
     [[ -n ${LOOP} ]] && losetup -d "${LOOP}" 2>/dev/null || true
+    LOOP=
 }
-trap cleanup EXIT
+trap cleanup_mounts EXIT INT TERM
 
-LOOP=$(losetup --find --show --partscan "${WORK_IMAGE}")
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-    [[ -b ${LOOP}p1 && -b ${LOOP}p2 ]] && break
-    sleep 0.2
-done
-[[ -b ${LOOP}p1 && -b ${LOOP}p2 ]] || { echo "base image partitions did not appear" >&2; exit 1; }
+mount_image() {
+    local image=$1
+    mkdir -p "${ROOT_MNT}"
+    LOOP=$(losetup --find --show --partscan "${image}")
+    for _ in {1..20}; do
+        [[ -b ${LOOP}p1 && -b ${LOOP}p2 ]] && break
+        sleep 0.1
+    done
+    [[ -b ${LOOP}p1 && -b ${LOOP}p2 ]] || { echo "image partitions did not appear" >&2; exit 1; }
+    mount "${LOOP}p2" "${ROOT_MNT}"
+    mkdir -p "${BOOT_MNT}"
+    mount "${LOOP}p1" "${BOOT_MNT}"
+}
 
-set +e
-e2fsck -f -y "${LOOP}p2"
-FSCK_STATUS=$?
-set -e
-if (( FSCK_STATUS > 1 )); then
-    echo "e2fsck failed with status ${FSCK_STATUS}" >&2
-    exit "${FSCK_STATUS}"
-fi
-resize2fs "${LOOP}p2"
+prepare_key=$(
+    {
+        printf 'base_sha256=%s\n' "${actual_sha}"
+        printf 'image_size=%s\n' "${IMAGE_SIZE}"
+        sha256sum "${SCRIPT_DIR}/install-rootfs"
+    } | sha256sum | awk '{print $1}'
+)
+PREPARED_IMAGE=${CACHE_ROOT}/prepared-${prepare_key}.img
 
-mkdir -p "${ROOT_MNT}"
-mount "${LOOP}p2" "${ROOT_MNT}"
-mkdir -p "${BOOT_MNT}"
-mount "${LOOP}p1" "${BOOT_MNT}"
+if [[ ! -f ${PREPARED_IMAGE} ]]; then
+    echo "Preparing Raspberry Pi OS system dependency layer (one-time cache miss)..."
+    command -v chroot >/dev/null || { echo "missing host command: chroot" >&2; exit 1; }
+    [[ -x /usr/bin/qemu-aarch64-static ]] || {
+        echo "system-layer cache miss requires qemu-aarch64-static" >&2
+        echo "install: sudo apt install qemu-user-static binfmt-support" >&2
+        exit 1
+    }
+    [[ -r /proc/sys/fs/binfmt_misc/qemu-aarch64 ]] || {
+        echo "qemu-aarch64 binfmt handler is not registered" >&2
+        echo "enable: sudo systemctl restart systemd-binfmt" >&2
+        exit 1
+    }
 
-mkdir -p "${ROOT_MNT}/opt/mpfc" "${ROOT_MNT}/opt/occid" "${ROOT_MNT}/opt/hivelink"
-RSYNC_EXCLUDES=(--exclude=.git --exclude='__pycache__' --exclude='*.pyc' --exclude='deploy/rpi/.build' --exclude='deploy/rpi/.cache' --exclude='deploy/rpi/dist' --exclude='deploy/rpi/.vm')
-rsync -a --delete "${RSYNC_EXCLUDES[@]}" "${REPO_ROOT}/" "${ROOT_MNT}/opt/mpfc/"
-rsync -a --delete --exclude=.git --exclude='__pycache__' "${OCCID_PATH}/" "${ROOT_MNT}/opt/occid/"
-rsync -a --delete --exclude=.git --exclude='__pycache__' "${HIVELINK_PATH}/" "${ROOT_MNT}/opt/hivelink/"
+    PREP_WORK=${WORK_ROOT}/prepared.img
+    case "${BASE_IMAGE}" in
+        *.xz) xz -dc "${BASE_IMAGE}" > "${PREP_WORK}" ;;
+        *) cp --reflink=auto --sparse=always "${BASE_IMAGE}" "${PREP_WORK}" ;;
+    esac
 
-cp /usr/bin/qemu-aarch64-static "${ROOT_MNT}/usr/bin/qemu-aarch64-static"
-# Preserve the image's resolver setup while temporarily giving the chroot the
-# host resolver for apt/pip. Raspberry Pi OS often makes resolv.conf a symlink.
-cp -a "${ROOT_MNT}/etc/resolv.conf" "${WORK_ROOT}/resolv.conf.image" 2>/dev/null || true
-rm -f "${ROOT_MNT}/etc/resolv.conf"
-cp -L /etc/resolv.conf "${ROOT_MNT}/etc/resolv.conf"
-mount --bind /dev "${ROOT_MNT}/dev"
-mount --bind /dev/pts "${ROOT_MNT}/dev/pts"
-mount -t proc proc "${ROOT_MNT}/proc"
-mount -t sysfs sys "${ROOT_MNT}/sys"
+    truncate -s "${IMAGE_SIZE}" "${PREP_WORK}"
+    parted -s "${PREP_WORK}" resizepart 2 100%
+    LOOP=$(losetup --find --show --partscan "${PREP_WORK}")
+    for _ in {1..20}; do
+        [[ -b ${LOOP}p1 && -b ${LOOP}p2 ]] && break
+        sleep 0.1
+    done
+    [[ -b ${LOOP}p1 && -b ${LOOP}p2 ]] || { echo "base image partitions did not appear" >&2; exit 1; }
+    set +e
+    e2fsck -f -y "${LOOP}p2"
+    fsck_status=$?
+    set -e
+    (( fsck_status <= 1 )) || { echo "e2fsck failed with status ${fsck_status}" >&2; exit "${fsck_status}"; }
+    resize2fs "${LOOP}p2"
+    losetup -d "${LOOP}"
+    LOOP=
 
-export MPFC_PI_CONTROL_IP MPFC_PI_GUEST_IP MPFC_PI_PREFIX
-export MPFC_HIVELINK_PORT MPFC_NODE_NAME MPFC_CONTROL_NODE
-export MPFC_PI_VM_MAVLINK_CONNECTION MPFC_PI_PHYSICAL_MAVLINK_CONNECTION
-chroot "${ROOT_MNT}" /bin/bash /opt/mpfc/deploy/rpi/install-rootfs
+    mount_image "${PREP_WORK}"
+    cp /usr/bin/qemu-aarch64-static "${ROOT_MNT}/usr/bin/qemu-aarch64-static"
+    cp "${SCRIPT_DIR}/install-rootfs" "${ROOT_MNT}/tmp/mpfc-install-rootfs"
+    chmod 0755 "${ROOT_MNT}/tmp/mpfc-install-rootfs"
 
-SSH_PUBLIC_KEY_SHA256=none
-if [[ -n ${MPFC_PI_SSH_KEY:-} && -f ${MPFC_PI_SSH_KEY}.pub ]]; then
-    chroot "${ROOT_MNT}" install -d -o mpfc -g mpfc -m 0700 /home/mpfc/.ssh
-    install -m 0600 "${MPFC_PI_SSH_KEY}.pub" "${ROOT_MNT}/home/mpfc/.ssh/authorized_keys"
-    chroot "${ROOT_MNT}" chown mpfc:mpfc /home/mpfc/.ssh/authorized_keys
-    SSH_PUBLIC_KEY_SHA256=$(sha256sum "${MPFC_PI_SSH_KEY}.pub" | awk '{print $1}')
+    RESOLV_BACKUP=${WORK_ROOT}/resolv.conf.image
+    rm -f "${RESOLV_BACKUP}"
+    cp -a "${ROOT_MNT}/etc/resolv.conf" "${RESOLV_BACKUP}" 2>/dev/null || true
+    rm -f "${ROOT_MNT}/etc/resolv.conf"
+    cp -L /etc/resolv.conf "${ROOT_MNT}/etc/resolv.conf"
+    mount --bind /dev "${ROOT_MNT}/dev"
+    mount --bind /dev/pts "${ROOT_MNT}/dev/pts"
+    mount -t proc proc "${ROOT_MNT}/proc"
+    mount -t sysfs sys "${ROOT_MNT}/sys"
+
+    chroot "${ROOT_MNT}" /bin/bash -c 'MPFC_PI_PASSWORD=mpfc /tmp/mpfc-install-rootfs'
+
+    rm -f "${ROOT_MNT}/tmp/mpfc-install-rootfs"
+    rm -f "${ROOT_MNT}/usr/bin/qemu-aarch64-static"
+    rm -f "${ROOT_MNT}/etc/resolv.conf"
+    if [[ -e ${RESOLV_BACKUP} || -L ${RESOLV_BACKUP} ]]; then
+        cp -a "${RESOLV_BACKUP}" "${ROOT_MNT}/etc/resolv.conf"
+    fi
+    sync
+    cleanup_mounts
+
+    mv "${PREP_WORK}" "${PREPARED_IMAGE}.tmp"
+    mv "${PREPARED_IMAGE}.tmp" "${PREPARED_IMAGE}"
+    echo "Cached prepared system layer: ${PREPARED_IMAGE}"
 else
-    echo "warning: MPFC_PI_SSH_KEY.pub was not provided; physical image has no preinstalled SSH key" >&2
+    echo "Reusing cached Raspberry Pi OS system dependency layer."
 fi
 
-rm -f "${ROOT_MNT}/usr/bin/qemu-aarch64-static"
-rm -f "${ROOT_MNT}/etc/resolv.conf"
-if [[ -e ${WORK_ROOT}/resolv.conf.image || -L ${WORK_ROOT}/resolv.conf.image ]]; then
-    cp -a "${WORK_ROOT}/resolv.conf.image" "${ROOT_MNT}/etc/resolv.conf"
+WORK_IMAGE=${WORK_ROOT}/root.img
+cp --reflink=auto --sparse=always "${PREPARED_IMAGE}" "${WORK_IMAGE}"
+mount_image "${WORK_IMAGE}"
+
+# Cheap source/configuration overlay. No target package manager is invoked here.
+mkdir -p "${ROOT_MNT}/opt/mpfc" "${ROOT_MNT}/opt/occid" "${ROOT_MNT}/opt/hivelink"
+RSYNC_EXCLUDES=(
+    --exclude=.git
+    --exclude='__pycache__'
+    --exclude='*.pyc'
+    --exclude='.venv'
+    --exclude='deploy/rpi/.build'
+    --exclude='deploy/rpi/.cache'
+    --exclude='deploy/rpi/dist'
+    --exclude='deploy/rpi/.vm'
+)
+rsync -a --delete "${RSYNC_EXCLUDES[@]}" "${REPO_ROOT}/" "${ROOT_MNT}/opt/mpfc/"
+rsync -a --delete --exclude=.git --exclude='__pycache__' --exclude='*.pyc' \
+    "${OCCID_PATH}/" "${ROOT_MNT}/opt/occid/"
+rsync -a --delete --exclude=.git --exclude='__pycache__' --exclude='*.pyc' \
+    "${HIVELINK_PATH}/" "${ROOT_MNT}/opt/hivelink/"
+rsync -a "${REPO_ROOT}/deploy/rpi/rootfs/" "${ROOT_MNT}/"
+chmod 0755 "${ROOT_MNT}/opt/mpfc/deploy/rpi/run-mpfc" "${ROOT_MNT}/opt/mpfc/deploy/rpi/configure-fc"
+chmod 0755 "${ROOT_MNT}/usr/local/sbin/mpfc-runtime-config"
+chmod 0440 "${ROOT_MNT}/etc/sudoers.d/mpfc"
+
+# Build the complete Python requirement input. crcmod is deliberately supplied
+# by Debian's ARM64 python3-crcmod package in the cached system layer because it
+# contains a target-native extension; all wheel-backed dependencies are staged
+# by host pip without running ARM Python.
+COMBINED_REQUIREMENTS=${WORK_ROOT}/python-requirements.txt
+cat "${REPO_ROOT}/requirements-runtime.txt" > "${COMBINED_REQUIREMENTS}"
+if [[ -f ${HIVELINK_PATH}/requirements.txt ]]; then
+    awk '
+        /^[[:space:]]*($|#)/ { next }
+        /^[[:space:]]*crcmod([[:space:]<>=!~].*)?$/ { next }
+        { print }
+    ' "${HIVELINK_PATH}/requirements.txt" >> "${COMBINED_REQUIREMENTS}"
 fi
 
-# The same SD image boots real Zero 2 W hardware through Raspberry Pi firmware.
-# QEMU direct-boots the image with the Pi 3 family kernel/DTB copied beside it.
+VENV_SITE=$(find "${ROOT_MNT}/opt/mpfc/.venv/lib" -mindepth 2 -maxdepth 2 -type d -name site-packages | head -n 1)
+[[ -n ${VENV_SITE} ]] || { echo "prepared image is missing MPFC venv site-packages" >&2; exit 1; }
+PYTHON_DIR=$(basename -- "$(dirname -- "${VENV_SITE}")")
+PYTHON_VERSION=${PYTHON_DIR#python}
+[[ ${PYTHON_VERSION} =~ ^3\.[0-9]+$ ]] || { echo "unable to derive target Python version from ${VENV_SITE}" >&2; exit 1; }
+
+python_key=$(
+    {
+        printf 'python_version=%s\n' "${PYTHON_VERSION}"
+        printf 'platform=manylinux2014_aarch64\n'
+        cat "${COMBINED_REQUIREMENTS}"
+        sha256sum "${SCRIPT_DIR}/stage-python"
+    } | sha256sum | awk '{print $1}'
+)
+PYTHON_CACHE=${CACHE_ROOT}/python-${python_key}
+if [[ ! -f ${PYTHON_CACHE}/.complete ]]; then
+    echo "Cross-staging ARM64 Python dependencies on host..."
+    rm -rf "${PYTHON_CACHE}.tmp"
+    bash "${SCRIPT_DIR}/stage-python" "${COMBINED_REQUIREMENTS}" "${PYTHON_CACHE}.tmp" "${PYTHON_VERSION}"
+    touch "${PYTHON_CACHE}.tmp/.complete"
+    rm -rf "${PYTHON_CACHE}"
+    mv "${PYTHON_CACHE}.tmp" "${PYTHON_CACHE}"
+else
+    echo "Reusing cached ARM64 Python dependency layer."
+fi
+
+rsync -a --delete --exclude=.complete "${PYTHON_CACHE}/" "${VENV_SITE}/"
+printf '/opt/hivelink\n' > "${VENV_SITE}/hivelink-source.pth"
+
+# Final appliance identity and runtime configuration are host-written and cheap.
+MPFC_UID=$(awk -F: '$1 == "mpfc" {print $3; exit}' "${ROOT_MNT}/etc/passwd")
+MPFC_GID=$(awk -F: '$1 == "mpfc" {print $4; exit}' "${ROOT_MNT}/etc/passwd")
+[[ -n ${MPFC_UID} && -n ${MPFC_GID} ]] || { echo "prepared image is missing mpfc account" >&2; exit 1; }
+PASSWORD_HASH=$(openssl passwd -6 "${MPFC_PI_PASSWORD}")
+sed -i -E "s#^mpfc:[^:]*:#mpfc:${PASSWORD_HASH}:#" "${ROOT_MNT}/etc/shadow"
+
+install -d -m 0755 "${ROOT_MNT}/etc/mpfc"
+cat > "${ROOT_MNT}/etc/mpfc/runtime.env" <<EOF_RUNTIME
+MPFC_CONFIG=/opt/mpfc/flight_cores/execution_host/config_appliance.yaml
+OCCID_PATH=/opt/occid
+MPFC_NODE_NAME=${MPFC_NODE_NAME}
+MPFC_CONTROL_NODE=${MPFC_CONTROL_NODE}
+MPFC_CONTROL_HOST=${MPFC_PI_CONTROL_IP}
+MPFC_HIVELINK_PORT=${MPFC_HIVELINK_PORT}
+MPFC_MAVLINK_CONNECTION=${MPFC_PI_PHYSICAL_MAVLINK_CONNECTION}
+PYTHONUNBUFFERED=1
+EOF_RUNTIME
+chmod 0644 "${ROOT_MNT}/etc/mpfc/runtime.env"
+
+install -d -m 0700 "${ROOT_MNT}/etc/NetworkManager/system-connections"
+cat > "${ROOT_MNT}/etc/NetworkManager/system-connections/mpfc-qemu.nmconnection" <<EOF_NETWORK
+[connection]
+id=mpfc-qemu
+type=ethernet
+autoconnect=true
+
+[ethernet]
+
+[ipv4]
+method=manual
+address1=${MPFC_PI_GUEST_IP}/${MPFC_PI_PREFIX}
+never-default=true
+
+[ipv6]
+method=disabled
+
+[proxy]
+EOF_NETWORK
+chmod 0600 "${ROOT_MNT}/etc/NetworkManager/system-connections/mpfc-qemu.nmconnection"
+
+if ! grep -Eq '^enable_uart=1$' "${BOOT_MNT}/config.txt"; then
+    printf '\nenable_uart=1\n' >> "${BOOT_MNT}/config.txt"
+fi
+
+install -d -m 0755 "${ROOT_MNT}/etc/systemd/system/multi-user.target.wants"
+ln -sfn ../mpfc-runtime-config.service "${ROOT_MNT}/etc/systemd/system/multi-user.target.wants/mpfc-runtime-config.service"
+ln -sfn ../mpfc.service "${ROOT_MNT}/etc/systemd/system/multi-user.target.wants/mpfc.service"
+chown -R "${MPFC_UID}:${MPFC_GID}" "${ROOT_MNT}/opt/mpfc" "${ROOT_MNT}/opt/occid" "${ROOT_MNT}/opt/hivelink"
+
+# The same raw image boots real Zero 2 W hardware through Raspberry Pi firmware.
+# QEMU direct-boots the Pi 3 family kernel/DTB copied beside it.
 [[ -f ${BOOT_MNT}/kernel8.img ]] || { echo "kernel8.img missing from Raspberry Pi OS image" >&2; exit 1; }
 [[ -f ${BOOT_MNT}/bcm2710-rpi-3-b-plus.dtb ]] || { echo "Pi 3B+ DTB missing from Raspberry Pi OS image" >&2; exit 1; }
-
 OUTPUT=$(realpath -m "${OUTPUT}")
 mkdir -p "$(dirname -- "${OUTPUT}")"
 cp "${BOOT_MNT}/kernel8.img" "${OUTPUT}.kernel8.img"
 cp "${BOOT_MNT}/bcm2710-rpi-3-b-plus.dtb" "${OUTPUT}.raspi3ap.dtb"
 
 sync
-cleanup
-set -e
-trap - EXIT
-LOOP=
+cleanup_mounts
+trap - EXIT INT TERM
 
 mv "${WORK_IMAGE}" "${OUTPUT}"
 
@@ -221,6 +355,9 @@ built_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 base_url=${BASE_URL}
 base_sha256=${actual_sha}
 image_size=${IMAGE_SIZE}
+prepared_cache_key=${prepare_key}
+python_cache_key=${python_key}
+target_python=${PYTHON_VERSION}
 mpfc_revision=$(source_revision "${REPO_ROOT}")
 occid_revision=$(source_revision "${OCCID_PATH}")
 hivelink_revision=$(source_revision "${HIVELINK_PATH}")
@@ -232,7 +369,8 @@ network_prefix=${MPFC_PI_PREFIX}
 hivelink_port=${MPFC_HIVELINK_PORT}
 physical_mavlink_default=${MPFC_PI_PHYSICAL_MAVLINK_CONNECTION}
 vm_mavlink_default=${MPFC_PI_VM_MAVLINK_CONNECTION}
-ssh_public_key_sha256=${SSH_PUBLIC_KEY_SHA256}
+login_user=mpfc
+login_auth=password
 EOF_MANIFEST
 sha256sum "${OUTPUT}" > "${OUTPUT}.sha256"
 
@@ -242,4 +380,7 @@ if [[ ${COMPRESS} -eq 1 ]]; then
 fi
 
 echo "Built: ${OUTPUT}"
-echo "VM:    ${SCRIPT_DIR}/pi-vm up --image ${OUTPUT}"
+echo "System layer: ${PREPARED_IMAGE}"
+echo "Python layer: ${PYTHON_CACHE}"
+echo "Login: mpfc / ${MPFC_PI_PASSWORD}"
+echo "VM: ${SCRIPT_DIR}/pi-vm up --image ${OUTPUT}"
