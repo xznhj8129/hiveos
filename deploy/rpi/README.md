@@ -68,9 +68,14 @@ mpfc-rpi-zero2w.img.raspi3ap.dtb
 The raw `.img` is the physical SD-card artifact. The kernel and DTB sidecars are
 only for QEMU direct boot.
 
+When `MPFC_PI_SSH_KEY` names a private key and the matching `.pub` file exists,
+the builder installs that public key into `/home/mpfc/.ssh/authorized_keys` in
+the raw image. Sigmac3 supplies its configured MPFC SSH identity when it builds
+the appliance. A standalone build without a key is allowed but emits a warning.
+
 The manifest records the Raspberry Pi OS base hash, MPFC/OCCID/HiveLink source
-revisions, node names, IP addresses, prefix, HiveLink port, and physical/VM
-MAVLink defaults used to construct the image.
+revisions, node names, IP addresses, prefix, HiveLink port, physical/VM MAVLink
+defaults, and the installed SSH public-key hash when one was supplied.
 
 A deployment manager can therefore detect that an existing image is stale
 instead of silently running an appliance built from different sources or
@@ -78,7 +83,7 @@ network settings.
 
 ## Physical Pi
 
-Write the image with Raspberry Pi Imager or another raw-image writer. For
+Write the image with Raspberry Pi Imager or another raw image writer. For
 example:
 
 ```bash
