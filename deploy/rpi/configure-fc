@@ -9,9 +9,9 @@ Examples:
   sudo configure-fc /dev/serial0 921600
   sudo configure-fc /dev/ttyUSB0 460800
 
-Writes the physical appliance MAVLink endpoint to /etc/mpfc/runtime.env and
-restarts MPFC. The VM does not use this command; it supplies a UDP override on
-its MPFC_CONFIG disk.
+Changes only the physical appliance MAVLink endpoint in /etc/mpfc/runtime.env
+and restarts MPFC. Node identity and network configuration remain unchanged.
+The VM supplies its own UDP override on the MPFC_CONFIG disk.
 USAGE
 }
 
@@ -27,6 +27,8 @@ fi
 
 TTY_DEVICE=$1
 BAUD=${2:-921600}
+RUNTIME_ENV=/etc/mpfc/runtime.env
+CONNECTION="serial://${TTY_DEVICE}:${BAUD}"
 
 if [[ ${TTY_DEVICE} != /dev/* ]]; then
     echo "tty device must be an absolute /dev path: ${TTY_DEVICE}" >&2
@@ -36,17 +38,28 @@ if [[ ! ${BAUD} =~ ^[0-9]+$ ]]; then
     echo "baud must be numeric: ${BAUD}" >&2
     exit 2
 fi
+if [[ ! -f ${RUNTIME_ENV} ]]; then
+    echo "missing appliance runtime configuration: ${RUNTIME_ENV}" >&2
+    exit 1
+fi
 
-install -d -m 0755 /etc/mpfc
-cat > /etc/mpfc/runtime.env <<EOF_ENV
-MPFC_CONFIG=/opt/mpfc/flight_cores/execution_host/config_appliance.yaml
-OCCID_PATH=/opt/occid
-MPFC_MAVLINK_CONNECTION=serial://${TTY_DEVICE}:${BAUD}
-PYTHONUNBUFFERED=1
-EOF_ENV
-chmod 0644 /etc/mpfc/runtime.env
+TMP=$(mktemp)
+trap 'rm -f "${TMP}"' EXIT
+awk -v connection="${CONNECTION}" '
+    BEGIN { replaced = 0 }
+    /^MPFC_MAVLINK_CONNECTION=/ {
+        print "MPFC_MAVLINK_CONNECTION=" connection
+        replaced = 1
+        next
+    }
+    { print }
+    END {
+        if (!replaced) print "MPFC_MAVLINK_CONNECTION=" connection
+    }
+' "${RUNTIME_ENV}" > "${TMP}"
+install -m 0644 "${TMP}" "${RUNTIME_ENV}"
 
 usermod -a -G dialout mpfc
 systemctl restart mpfc.service
 
-echo "MPFC FC endpoint: serial://${TTY_DEVICE}:${BAUD}"
+echo "MPFC FC endpoint: ${CONNECTION}"
