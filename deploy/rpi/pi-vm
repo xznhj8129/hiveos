@@ -12,7 +12,6 @@ GUEST_IP=${MPFC_PI_GUEST_IP}
 GUEST_PREFIX=${MPFC_PI_PREFIX}
 BRIDGE=${MPFC_PI_BRIDGE}
 TAP=${MPFC_PI_TAP}
-SSH_KEY=${MPFC_PI_SSH_KEY:-${HOME}/.ssh/id_ed25519}
 
 usage() {
     cat <<EOF_USAGE
@@ -27,15 +26,18 @@ Commands:
   start    Run it in the background
   stop     Stop a background VM and remove its bridge/tap
   console  Follow the background VM serial console
-  ssh      SSH directly to ${GUEST_IP}
+  ssh      SSH directly to ${GUEST_IP} as mpfc
   logs     Follow mpfc.service logs
-  deploy   Rsync MPFC + sibling OCCID/HiveLink into the guest and restart
+  deploy   Rsync source overlays into the guest and restart MPFC
 
 Options used by up/start:
   --image PATH         Appliance raw image, default ${DEFAULT_IMAGE}
   --bridge NAME        Linux bridge, default ${BRIDGE}
   --tap NAME           QEMU tap device, default ${TAP}
-  --ssh-key PATH       SSH private key; PATH.pub is injected into the VM
+
+Login:
+  user                 mpfc
+  password             MPFC_PI_PASSWORD (default: mpfc)
 EOF_USAGE
 }
 
@@ -48,7 +50,6 @@ while [[ $# -gt 0 ]]; do
         --image) IMAGE=$2; shift 2 ;;
         --bridge) BRIDGE=$2; shift 2 ;;
         --tap) TAP=$2; shift 2 ;;
-        --ssh-key) SSH_KEY=$2; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -69,16 +70,24 @@ sudo_cmd() {
     fi
 }
 
+export SSHPASS=${MPFC_PI_PASSWORD}
 ssh_base=(
-    ssh
+    sshpass -e ssh
     -o StrictHostKeyChecking=no
     -o UserKnownHostsFile=/dev/null
     -o ConnectTimeout=5
+    -o PubkeyAuthentication=no
+    -o PreferredAuthentications=password
+    "mpfc@${GUEST_IP}"
 )
-if [[ -f ${SSH_KEY} ]]; then
-    ssh_base+=(-i "${SSH_KEY}")
-fi
-ssh_base+=("mpfc@${GUEST_IP}")
+
+require_sshpass() {
+    command -v sshpass >/dev/null || {
+        echo "missing host command: sshpass" >&2
+        echo "install: sudo apt install sshpass" >&2
+        exit 1
+    }
+}
 
 require_vm_files() {
     [[ -f ${IMAGE} ]] || {
@@ -97,11 +106,8 @@ ensure_network() {
         sudo_cmd ip link add name "${BRIDGE}" type bridge
     fi
 
-    # Never install the guest's LAN prefix on the host bridge. The configured
-    # appliance addresses may deliberately mirror a physical deployment on the
-    # host's real LAN. Claiming that whole prefix here would install a competing
-    # connected route and blackhole the host's physical LAN. Keep the bridge
-    # host-only and route exactly one guest address into the tap instead.
+    # The host bridge owns one address and one guest route only. It must never
+    # claim the physical LAN prefix used by the real appliance deployment.
     sudo_cmd ip addr flush dev "${BRIDGE}" scope global
     sudo_cmd ip addr add "${CONTROL_IP}/32" dev "${BRIDGE}"
     sudo_cmd ip link set "${BRIDGE}" up
@@ -143,11 +149,6 @@ MPFC_HIVELINK_PORT=${MPFC_HIVELINK_PORT}
 MPFC_MAVLINK_CONNECTION=${MPFC_PI_VM_MAVLINK_CONNECTION}
 EOF_ENV
     mcopy -o -i "${CFG_IMAGE}" "${VM_DIR}/runtime.env" ::runtime.env
-    if [[ -f ${SSH_KEY}.pub ]]; then
-        mcopy -o -i "${CFG_IMAGE}" "${SSH_KEY}.pub" ::authorized_keys
-    else
-        echo "warning: ${SSH_KEY}.pub not found; SSH helper commands require an injected key" >&2
-    fi
 }
 
 make_qemu_dtb() {
@@ -162,12 +163,9 @@ make_qemu_dtb() {
         }
     done
 
-    # Modern Raspberry Pi kernels expose the real BCM2835 PM block, including
-    # its ASB register range, through the Pi 3 DTB. QEMU's raspi3 model does not
-    # faithfully provide that block; probing bcm2835-power can therefore raise
-    # a synchronous external abort before userspace starts. The raw appliance
-    # and its original DTB remain physical-hardware artifacts. Patch only a
-    # throwaway QEMU copy and disable the unsupported PM/watchdog provider.
+    # Modern Raspberry Pi kernels probe the real BCM2835 PM/ASB block that the
+    # QEMU raspi3 model does not faithfully implement. Patch only the QEMU DTB
+    # copy; the physical image and original DTB remain untouched.
     cp "${IMAGE}.raspi3ap.dtb" "${QEMU_DTB}"
     while IFS= read -r node; do
         [[ -n ${node} ]] || continue
@@ -182,10 +180,7 @@ make_qemu_dtb() {
         esac
     done < <(fdtget -l "${QEMU_DTB}" /soc)
 
-    if [[ ${found} -ne 1 ]]; then
-        echo "unable to find BCM2835 PM/watchdog node in QEMU DTB" >&2
-        exit 1
-    fi
+    [[ ${found} -eq 1 ]] || { echo "unable to find BCM2835 PM/watchdog node in QEMU DTB" >&2; exit 1; }
 }
 
 qemu_args() {
@@ -203,7 +198,7 @@ ${IMAGE}.kernel8.img
 -dtb
 ${QEMU_DTB}
 -append
-rw earlyprintk loglevel=8 console=ttyAMA1,115200 dwc_otg.lpm_enable=0 root=/dev/mmcblk0p2 rootfstype=ext4 rootdelay=1 rootwait fsck.repair=yes net.ifnames=0 systemd.mask=userconfig.service systemd.mask=systemd-networkd-wait-online.service
+rw earlyprintk loglevel=8 console=ttyAMA1,115200 dwc_otg.lpm_enable=0 root=/dev/mmcblk0p2 rootfstype=ext4 rootdelay=1 rootwait fsck.repair=yes net.ifnames=0
 -drive
 file=${IMAGE},format=raw,if=sd,index=0,snapshot=on
 -usb
@@ -293,13 +288,16 @@ case "${COMMAND}" in
         exec tail -n 200 -F "${CONSOLE_LOG}"
         ;;
     ssh)
+        require_sshpass
         exec "${ssh_base[@]}"
         ;;
     logs)
+        require_sshpass
         exec "${ssh_base[@]}" journalctl -fu mpfc.service
         ;;
     deploy)
         command -v rsync >/dev/null || { echo "missing rsync" >&2; exit 1; }
+        require_sshpass
         REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
         OCCID_PATH=$(cd -- "${REPO_ROOT}/.." && pwd)/occid
         HIVELINK_PATH=$(cd -- "${REPO_ROOT}/.." && pwd)/hivelink
@@ -307,8 +305,7 @@ case "${COMMAND}" in
             echo "expected sibling occid and hivelink checkouts" >&2
             exit 1
         }
-        RSYNC_SSH="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
-        [[ -f ${SSH_KEY} ]] && RSYNC_SSH+=" -i ${SSH_KEY}"
+        RSYNC_SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no -o PreferredAuthentications=password"
         common_excludes=(
             --exclude=.git
             --exclude='__pycache__'
@@ -321,11 +318,10 @@ case "${COMMAND}" in
         )
         rsync -az --delete "${common_excludes[@]}" -e "${RSYNC_SSH}" \
             "${REPO_ROOT}/" "mpfc@${GUEST_IP}:/opt/mpfc/"
-        rsync -az --delete --exclude=.git --exclude='__pycache__' -e "${RSYNC_SSH}" \
+        rsync -az --delete --exclude=.git --exclude='__pycache__' --exclude='*.pyc' -e "${RSYNC_SSH}" \
             "${OCCID_PATH}/" "mpfc@${GUEST_IP}:/opt/occid/"
-        rsync -az --delete --exclude=.git --exclude='__pycache__' -e "${RSYNC_SSH}" \
+        rsync -az --delete --exclude=.git --exclude='__pycache__' --exclude='*.pyc' -e "${RSYNC_SSH}" \
             "${HIVELINK_PATH}/" "mpfc@${GUEST_IP}:/opt/hivelink/"
-        "${ssh_base[@]}" /opt/mpfc/.venv/bin/pip install -e /opt/hivelink
         "${ssh_base[@]}" sudo /usr/bin/systemctl restart mpfc.service
         ;;
     *)
