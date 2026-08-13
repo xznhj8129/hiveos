@@ -2,6 +2,7 @@
 # deploy/rpi/run-mpfc injects node identity, HiveLink addressing and the
 # concrete MAVSDK connection from /etc/mpfc/runtime.env plus VM overrides.
 my_name: appliance
+runtime_mode: resident
 
 vehicle:
   autopilot: AutopilotType.PX4
