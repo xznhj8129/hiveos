@@ -14,6 +14,7 @@ import sys
 import queue
 import json
 import re
+import signal
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -305,6 +306,12 @@ def start_from_config(config_path: Path, overrides: Dict[str, str]) -> None:
     vehicle = resolve_vehicle_config(config)
     resolve_plugin_supports(config)
     configure_runtime_plugins(config, vehicle)
+
+    runtime_mode = str(config.get("runtime_mode", "mission")).strip().lower()
+    if runtime_mode not in {"mission", "resident"}:
+        raise RuntimeError(f"invalid runtime_mode {runtime_mode!r}; expected mission or resident")
+    resident_runtime = runtime_mode == "resident"
+
     config_dump = json.dumps(config, indent=2, sort_keys=True)
     base_dir = config_path.parent
     raw_bus_config = config["bus_config"]
@@ -361,7 +368,10 @@ def start_from_config(config_path: Path, overrides: Dict[str, str]) -> None:
 
     sys.stdout = Tee([console_out, log_handle])
     sys.stderr = Tee([console_err, log_handle])
-    print(f"[MAIN] using config {config_path}:\n{config_dump}", flush=True)
+    print(
+        f"[MAIN] runtime_mode={runtime_mode} using config {config_path}:\n{config_dump}",
+        flush=True,
+    )
 
     plugins_raw = config["plugins"]
     core_config = config["core"]
@@ -402,20 +412,49 @@ def start_from_config(config_path: Path, overrides: Dict[str, str]) -> None:
 
     shutdown_requested = False
     shutdown_started_at: float | None = None
+    failure_reason: str | None = None
+    terminate_requested = False
+
+    def _handle_sigterm(_signum: int, _frame: Any) -> None:
+        nonlocal terminate_requested
+        terminate_requested = True
+
+    previous_sigterm = signal.signal(signal.SIGTERM, _handle_sigterm)
     try:
         while True:
             try:
                 topic, _message = bus_client.receive(timeout=0.2)
             except queue.Empty:
                 topic = None
-            if topic == CONTROL_SHUTDOWN_TOPIC:
+
+            if terminate_requested:
+                shutdown_requested = True
+            elif topic == CONTROL_SHUTDOWN_TOPIC:
                 shutdown_requested = True
             elif topic and topic.endswith("/ERROR"):
+                if failure_reason is None:
+                    failure_reason = f"runtime component reported error topic={topic}"
+                    print(f"[MAIN] {failure_reason}", flush=True)
                 shutdown_requested = True
 
             dead = [proc for proc in all_procs if not proc.is_alive()]
             if dead and not shutdown_requested:
+                names = ", ".join(f"{proc.name}({proc.exitcode})" for proc in dead)
+                if (
+                    not resident_runtime
+                    and core_proc in dead
+                    and core_proc.exitcode == 0
+                    and all(proc is core_proc or proc.is_alive() for proc in all_procs)
+                ):
+                    print(
+                        f"[MAIN] mission core completed: {core_proc.name}(0); terminating remaining",
+                        flush=True,
+                    )
+                else:
+                    failure_reason = f"unexpected runtime component exit: {names}"
+                    print(f"[MAIN] {failure_reason}; terminating remaining", flush=True)
                 shutdown_requested = True
+
             if shutdown_requested and shutdown_started_at is None:
                 shutdown_started_at = time.monotonic()
                 try:
@@ -425,30 +464,24 @@ def start_from_config(config_path: Path, overrides: Dict[str, str]) -> None:
                     )
                 except MqttPublishError:
                     pass
-            if shutdown_requested:
-                alive = [proc for proc in all_procs if proc.is_alive()]
-                if not alive:
-                    break
-                if (
-                    shutdown_started_at is not None
-                    and time.monotonic() - shutdown_started_at > 5.0
-                ):
-                    for proc in alive:
-                        proc.terminate()
-                    break
+
+            if not shutdown_requested:
                 continue
 
-            if not dead:
-                continue
-            names = ", ".join(f"{p.name}({p.exitcode})" for p in dead)
-            print(
-                f"[MAIN] detected exit: {names}, terminating remaining",
-                flush=True,
-            )
-            shutdown_requested = True
+            alive = [proc for proc in all_procs if proc.is_alive()]
+            if not alive:
+                break
+            if (
+                shutdown_started_at is not None
+                and time.monotonic() - shutdown_started_at > 5.0
+            ):
+                for proc in alive:
+                    proc.terminate()
+                break
     except KeyboardInterrupt:
         print("[MAIN] interrupt received, terminating", flush=True)
     finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
         alive = [proc for proc in all_procs if proc.is_alive()]
         if alive:
             try:
@@ -470,6 +503,9 @@ def start_from_config(config_path: Path, overrides: Dict[str, str]) -> None:
             if proc.is_alive():
                 proc.terminate()
             proc.join(timeout=5.0)
+
+    if failure_reason is not None:
+        raise RuntimeError(failure_reason)
 
 
 def main() -> None:
