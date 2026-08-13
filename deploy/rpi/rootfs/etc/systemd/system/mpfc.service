@@ -1,7 +1,6 @@
 [Unit]
 Description=MPFC companion runtime
-After=network-online.target mosquitto.service mpfc-runtime-config.service
-Wants=network-online.target
+After=mosquitto.service mpfc-runtime-config.service
 Requires=mosquitto.service mpfc-runtime-config.service
 
 [Service]
