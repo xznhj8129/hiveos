@@ -66,7 +66,7 @@ if [[ ${EUID} -ne 0 ]]; then
     exit 1
 fi
 
-for cmd in curl xz sha256sum losetup mount umount mountpoint rsync truncate realpath git parted e2fsck resize2fs openssl python3 awk sed find cp sync; do
+for cmd in curl xz sha256sum losetup mount umount mountpoint rsync truncate realpath git parted e2fsck resize2fs openssl python3 awk sed find cp sync stat chown chmod; do
     command -v "${cmd}" >/dev/null || { echo "missing host command: ${cmd}" >&2; exit 1; }
 done
 python3 -m pip --version >/dev/null 2>&1 || {
@@ -115,7 +115,19 @@ cleanup_mounts() {
     [[ -n ${LOOP} ]] && losetup -d "${LOOP}" 2>/dev/null || true
     LOOP=
 }
-trap cleanup_mounts EXIT INT TERM
+
+return_host_ownership() {
+    set +e
+    if [[ -n ${SUDO_UID:-} && -n ${SUDO_GID:-} && ${SUDO_UID} != 0 ]]; then
+        chown -R "${SUDO_UID}:${SUDO_GID}" "${WORK_ROOT}" "${CACHE_ROOT}" "${DIST_ROOT}" 2>/dev/null || true
+    fi
+}
+
+cleanup_all() {
+    cleanup_mounts
+    return_host_ownership
+}
+trap cleanup_all EXIT INT TERM
 
 mount_image() {
     local image=$1
@@ -129,6 +141,17 @@ mount_image() {
     mount "${LOOP}p2" "${ROOT_MNT}"
     mkdir -p "${BOOT_MNT}"
     mount "${LOOP}p1" "${BOOT_MNT}"
+}
+
+assert_meta() {
+    local path=$1
+    local expected=$2
+    local actual
+    actual=$(stat -c '%u:%g:%a' "${ROOT_MNT}${path}")
+    [[ ${actual} == "${expected}" ]] || {
+        echo "invalid appliance metadata: ${path} expected=${expected} actual=${actual}" >&2
+        exit 1
+    }
 }
 
 prepare_key=$(
@@ -231,10 +254,35 @@ rsync -a --delete --exclude=.git --exclude='__pycache__' --exclude='*.pyc' \
     "${OCCID_PATH}/" "${ROOT_MNT}/opt/occid/"
 rsync -a --delete --exclude=.git --exclude='__pycache__' --exclude='*.pyc' \
     "${HIVELINK_PATH}/" "${ROOT_MNT}/opt/hivelink/"
-rsync -a "${REPO_ROOT}/deploy/rpi/rootfs/" "${ROOT_MNT}/"
+
+# Repository rootfs overlays are system files. Never preserve the host checkout
+# uid/gid here: doing so can make sudo reject /etc/sudoers.d and can leave SSH
+# or systemd configuration owned by the developer account.
+rsync -a --chown=0:0 "${REPO_ROOT}/deploy/rpi/rootfs/" "${ROOT_MNT}/"
+
+# Remove Raspberry Pi OS interactive first-user state in the cheap final layer.
+# The mpfc account is already provisioned in the prepared system layer.
+rm -f "${ROOT_MNT}/etc/ssh/sshd_config.d/rename_user.conf"
+rm -f "${ROOT_MNT}/etc/sudoers.d/010_wiz-nopasswd"
+rm -rf "${ROOT_MNT}/var/lib/userconf-pi"
+
+# These services are irrelevant to the Zero 2 W companion appliance. Masking
+# them here avoids invalidating the cached apt/system layer.
+for unit in rpi-eeprom-update.service avahi-daemon.service udisks2.service sshswitch.service; do
+    ln -sfn /dev/null "${ROOT_MNT}/etc/systemd/system/${unit}"
+done
+
 chmod 0755 "${ROOT_MNT}/opt/mpfc/deploy/rpi/run-mpfc" "${ROOT_MNT}/opt/mpfc/deploy/rpi/configure-fc"
 chmod 0755 "${ROOT_MNT}/usr/local/sbin/mpfc-runtime-config"
+chmod 0755 "${ROOT_MNT}/etc/sudoers.d"
 chmod 0440 "${ROOT_MNT}/etc/sudoers.d/mpfc"
+chown root:root \
+    "${ROOT_MNT}/etc/sudoers.d" \
+    "${ROOT_MNT}/etc/sudoers.d/mpfc" \
+    "${ROOT_MNT}/etc/ssh/sshd_config.d/00-mpfc.conf" \
+    "${ROOT_MNT}/etc/systemd/system/mpfc.service" \
+    "${ROOT_MNT}/etc/systemd/system/mpfc-runtime-config.service" \
+    "${ROOT_MNT}/usr/local/sbin/mpfc-runtime-config"
 
 # Build the complete Python requirement input. crcmod is deliberately supplied
 # by Debian's ARM64 python3-crcmod package in the cached system layer because it
@@ -277,7 +325,6 @@ else
 fi
 
 rsync -a --delete --exclude=.complete "${PYTHON_CACHE}/" "${VENV_SITE}/"
-printf '/opt/hivelink\n' > "${VENV_SITE}/hivelink-source.pth"
 
 # Final appliance identity and runtime configuration are host-written and cheap.
 MPFC_UID=$(awk -F: '$1 == "mpfc" {print $3; exit}' "${ROOT_MNT}/etc/passwd")
@@ -286,7 +333,7 @@ MPFC_GID=$(awk -F: '$1 == "mpfc" {print $4; exit}' "${ROOT_MNT}/etc/passwd")
 PASSWORD_HASH=$(openssl passwd -6 "${MPFC_PI_PASSWORD}")
 sed -i -E "s#^mpfc:[^:]*:#mpfc:${PASSWORD_HASH}:#" "${ROOT_MNT}/etc/shadow"
 
-install -d -m 0755 "${ROOT_MNT}/etc/mpfc"
+install -d -o root -g root -m 0755 "${ROOT_MNT}/etc/mpfc"
 cat > "${ROOT_MNT}/etc/mpfc/runtime.env" <<EOF_RUNTIME
 MPFC_CONFIG=/opt/mpfc/flight_cores/execution_host/config_appliance.yaml
 OCCID_PATH=/opt/occid
@@ -297,9 +344,10 @@ MPFC_HIVELINK_PORT=${MPFC_HIVELINK_PORT}
 MPFC_MAVLINK_CONNECTION=${MPFC_PI_PHYSICAL_MAVLINK_CONNECTION}
 PYTHONUNBUFFERED=1
 EOF_RUNTIME
+chown root:root "${ROOT_MNT}/etc/mpfc/runtime.env"
 chmod 0644 "${ROOT_MNT}/etc/mpfc/runtime.env"
 
-install -d -m 0700 "${ROOT_MNT}/etc/NetworkManager/system-connections"
+install -d -o root -g root -m 0700 "${ROOT_MNT}/etc/NetworkManager/system-connections"
 cat > "${ROOT_MNT}/etc/NetworkManager/system-connections/mpfc-qemu.nmconnection" <<EOF_NETWORK
 [connection]
 id=mpfc-qemu
@@ -318,16 +366,29 @@ method=disabled
 
 [proxy]
 EOF_NETWORK
+chown root:root "${ROOT_MNT}/etc/NetworkManager/system-connections/mpfc-qemu.nmconnection"
 chmod 0600 "${ROOT_MNT}/etc/NetworkManager/system-connections/mpfc-qemu.nmconnection"
 
 if ! grep -Eq '^enable_uart=1$' "${BOOT_MNT}/config.txt"; then
     printf '\nenable_uart=1\n' >> "${BOOT_MNT}/config.txt"
 fi
 
-install -d -m 0755 "${ROOT_MNT}/etc/systemd/system/multi-user.target.wants"
+install -d -o root -g root -m 0755 "${ROOT_MNT}/etc/systemd/system/multi-user.target.wants"
 ln -sfn ../mpfc-runtime-config.service "${ROOT_MNT}/etc/systemd/system/multi-user.target.wants/mpfc-runtime-config.service"
 ln -sfn ../mpfc.service "${ROOT_MNT}/etc/systemd/system/multi-user.target.wants/mpfc.service"
 chown -R "${MPFC_UID}:${MPFC_GID}" "${ROOT_MNT}/opt/mpfc" "${ROOT_MNT}/opt/occid" "${ROOT_MNT}/opt/hivelink"
+
+# Refuse to emit an image with broken privilege/config metadata. These checks
+# specifically cover the host-owner leakage that previously made sudo unusable.
+assert_meta /etc/sudoers.d 0:0:755
+assert_meta /etc/sudoers.d/mpfc 0:0:440
+assert_meta /etc/ssh/sshd_config.d/00-mpfc.conf 0:0:644
+assert_meta /etc/systemd/system/mpfc.service 0:0:644
+assert_meta /etc/systemd/system/mpfc-runtime-config.service 0:0:644
+assert_meta /usr/local/sbin/mpfc-runtime-config 0:0:755
+assert_meta /etc/mpfc/runtime.env 0:0:644
+[[ -f ${VENV_SITE}/occid-source.pth ]] || { echo "OCCID source path registration missing from Python layer" >&2; exit 1; }
+[[ -f ${VENV_SITE}/hivelink-source.pth ]] || { echo "HiveLink source path registration missing from Python layer" >&2; exit 1; }
 
 # The same raw image boots real Zero 2 W hardware through Raspberry Pi firmware.
 # QEMU direct-boots the Pi 3 family kernel/DTB copied beside it.
@@ -340,7 +401,6 @@ cp "${BOOT_MNT}/bcm2710-rpi-3-b-plus.dtb" "${OUTPUT}.raspi3ap.dtb"
 
 sync
 cleanup_mounts
-trap - EXIT INT TERM
 
 mv "${WORK_IMAGE}" "${OUTPUT}"
 
