@@ -1,4 +1,9 @@
+# Fast native x86 development runtime for the Block 1 execution path.
+# The QEMU user network exposes the host to the guest at 10.0.2.2.
+# sigmac3 forwards host UDP 14540 to this guest for PX4 SIH and host UDP
+# 15555 to guest UDP 5555 for control-side HiveLink delivery.
 my_name: uav1
+runtime_mode: resident
 
 vehicle:
   autopilot: AutopilotType.PX4
@@ -12,37 +17,41 @@ core:
     poll_interval_s: 0.25
 
 bus_config:
-  schema_path: ../../config/bus_topics_schema.json
-  log_file: hivebus.log
+  schema_path: /opt/mpfc/config/bus_topics_schema.json
+  log_file: /var/log/mpfc/hivebus.log
   endpoint:
     type: mqtt
     host: 127.0.0.1
     port: 1883
 
 plugins:
-- plugin: px4_sitl_gz_launcher
+- plugin: hivelink_interface
   cfg:
-    id: px4_sitl
-    auto_start: true
-    px4:
-      # Override without editing this file by setting PX4_AUTOPILOT_PATH.
-      px4_dir: ../PX4-Autopilot
-      sitl_vehicle: gz_x500
-      airframe_vehicle: gz_x500
-      companion_mavlink_port: 14540
-      qgc_mavlink_port: 14550
-      qgc_mavlink_enabled: false
-      qgc_local_port: 18571
-      home_lat: 47.397742
-      home_lon: 8.545594
-      home_alt: 488
-      model_pose: ""
-    gazebo:
-      gz_world: default
-      gz_ip: 127.0.0.1
-      gz_gui: true
-      video_host_ip: 127.0.0.1
-      video_host_port: 5601
+    id: hivelink
+    rx_poll_interval: 0.05
+    bus_poll_interval: 0.05
+    in_topic: OCCID/IN
+    out_topic: OCCID/OUT
+    link_config:
+      my_name: uav1
+      my_id: 0
+      udp:
+        use: true
+        host: 0.0.0.0
+        port: 5555
+        use_multicast: false
+        multicast_group: ''
+        multicast_port: 5555
+      meshtastic:
+        use: false
+        radio_serial: ''
+        app_portnum: 260
+        channel: 0
+      nodemap:
+        control:
+          ip:
+          - 10.0.2.2
+          - 5555
 
 - plugin: execution_ingress
   cfg:
@@ -51,10 +60,10 @@ plugins:
     auto_takeoff_for_move: true
     executor_id:
       id_type: DB_ID
-      value: mpfc:<my_name>
+      value: mpfc:uav1
     asset_id:
       id_type: DB_ID
-      value: <my_name>
+      value: uav1
 
 - plugin: uav_controller
   cfg:
