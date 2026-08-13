@@ -196,6 +196,35 @@ class ExecutionIngress(PluginBase):
         self.latest_reports: dict[str, Any] = {}
         self.active_execution_id: Any | None = None
         self.active_dispatch_id: str | None = None
+        self.lifecycle_state = "STARTING"
+        self.lifecycle_topic = f"DIAG/{self.client_id}/LIFECYCLE"
+
+    def _set_lifecycle(
+        self,
+        state: str,
+        remote: RemoteExecution | None = None,
+        detail: str | None = None,
+    ) -> None:
+        self.lifecycle_state = str(state)
+        data: dict[str, Any] = {"state": self.lifecycle_state}
+        if remote is not None:
+            data["dispatch_id"] = remote.dispatch_id
+            data["execution_id"] = _id_text(remote.bundle.execution.execution_id)
+        if detail:
+            data["detail"] = str(detail)
+        self.client.publish(
+            self.lifecycle_topic,
+            build_envelope(self.client_id, self.lifecycle_topic, data),
+        )
+        suffix = ""
+        if remote is not None:
+            suffix = f" dispatch_id={remote.dispatch_id}"
+        if detail:
+            suffix += f" detail={detail}"
+        print(
+            f"[EXECUTION_LIFECYCLE] state={self.lifecycle_state}{suffix}",
+            flush=True,
+        )
 
     @staticmethod
     def _dispatch_id(execution: Any) -> str:
@@ -659,6 +688,7 @@ class ExecutionIngress(PluginBase):
 
             self.active_execution_id = bundle.execution.execution_id
             self.active_dispatch_id = remote.dispatch_id
+            self._set_lifecycle("EXECUTING", remote)
             self._send_acceptance(
                 remote.source,
                 bundle.execution,
@@ -716,9 +746,11 @@ class ExecutionIngress(PluginBase):
         finally:
             self.active_execution_id = None
             self.active_dispatch_id = None
+            self._set_lifecycle("IDLE")
 
     def run(self) -> None:
         self.send_online()
+        self._set_lifecycle("IDLE")
         try:
             while True:
                 topic, payload = self._pump_once(
@@ -731,9 +763,19 @@ class ExecutionIngress(PluginBase):
         except KeyboardInterrupt:
             pass
         except Exception:
-            self.publish_error(traceback.format_exc().strip())
+            trace = traceback.format_exc().strip()
+            try:
+                self._set_lifecycle("FAULTED", detail=trace.splitlines()[-1])
+            except Exception:
+                pass
+            self.publish_error(trace)
             raise
         finally:
+            if self.lifecycle_state != "FAULTED":
+                try:
+                    self._set_lifecycle("STOPPING")
+                except Exception:
+                    pass
             self.stop()
 
 
