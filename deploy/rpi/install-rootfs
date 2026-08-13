@@ -40,10 +40,23 @@ install -d -m 0755 /opt/mpfc /opt/occid /opt/hivelink
 rm -rf /opt/mpfc/.venv
 python3 -m venv --without-pip --system-site-packages /opt/mpfc/.venv
 
-# Raspberry Pi OS first-boot UI and networkd wait logic are not appliance
-# services. The appliance is fully provisioned before it ever boots.
-systemctl mask userconfig.service >/dev/null 2>&1 || true
-systemctl mask systemd-networkd-wait-online.service >/dev/null 2>&1 || true
+# This is a pre-provisioned appliance, not an interactive Raspberry Pi OS
+# first-boot image. Remove user-rename/banner state that otherwise causes SSH to
+# warn that no valid user exists even though the mpfc account is already real.
+rm -f /etc/ssh/sshd_config.d/rename_user.conf
+rm -f /etc/sudoers.d/010_wiz-nopasswd
+rm -rf /var/lib/userconf-pi
+
+# Services that either belong to interactive first boot or to hardware absent
+# from the Zero 2 W appliance are not part of this runtime. NetworkManager and
+# wpa_supplicant remain available because the physical appliance may use them.
+systemctl mask \
+    userconfig.service \
+    systemd-networkd-wait-online.service \
+    rpi-eeprom-update.service \
+    avahi-daemon.service \
+    udisks2.service \
+    sshswitch.service >/dev/null 2>&1 || true
 systemctl enable ssh.service mosquitto.service >/dev/null
 
 rm -f /usr/sbin/policy-rc.d
