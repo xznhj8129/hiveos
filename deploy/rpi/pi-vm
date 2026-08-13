@@ -198,7 +198,7 @@ ${IMAGE}.kernel8.img
 -dtb
 ${QEMU_DTB}
 -append
-rw earlyprintk loglevel=8 console=ttyAMA1,115200 dwc_otg.lpm_enable=0 root=/dev/mmcblk0p2 rootfstype=ext4 rootdelay=1 rootwait fsck.repair=yes net.ifnames=0
+rw earlyprintk loglevel=8 console=ttyAMA1,115200 dwc_otg.lpm_enable=0 root=/dev/mmcblk0p2 rootfstype=ext4 rootdelay=1 rootwait fsck.repair=yes net.ifnames=0 mpfc.vm=1 systemd.mask=wpa_supplicant.service
 -drive
 file=${IMAGE},format=raw,if=sd,index=0,snapshot=on
 -usb
@@ -322,7 +322,7 @@ case "${COMMAND}" in
             "${OCCID_PATH}/" "mpfc@${GUEST_IP}:/opt/occid/"
         rsync -az --delete --exclude=.git --exclude='__pycache__' --exclude='*.pyc' -e "${RSYNC_SSH}" \
             "${HIVELINK_PATH}/" "mpfc@${GUEST_IP}:/opt/hivelink/"
-        "${ssh_base[@]}" sudo /usr/bin/systemctl restart mpfc.service
+        "${ssh_base[@]}" sudo -n /usr/bin/systemctl restart mpfc.service
         ;;
     *)
         echo "unknown command: ${COMMAND}" >&2
