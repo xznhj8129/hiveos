@@ -256,9 +256,12 @@ rsync -a --delete --exclude=.git --exclude='__pycache__' --exclude='*.pyc' \
     "${HIVELINK_PATH}/" "${ROOT_MNT}/opt/hivelink/"
 
 # Repository rootfs overlays are system files. Never preserve the host checkout
-# uid/gid here: doing so can make sudo reject /etc/sudoers.d and can leave SSH
-# or systemd configuration owned by the developer account.
-rsync -a --chown=0:0 "${REPO_ROOT}/deploy/rpi/rootfs/" "${ROOT_MNT}/"
+# uid/gid or writable mode bits here: doing so can make sudo reject
+# /etc/sudoers.d and can leave SSH or systemd configuration unsafe or invalid.
+# Normalize the whole overlay, then restore the small set of intentional
+# executable/restricted modes below.
+rsync -a --chown=0:0 --chmod=D0755,F0644 \
+    "${REPO_ROOT}/deploy/rpi/rootfs/" "${ROOT_MNT}/"
 
 # Remove Raspberry Pi OS interactive first-user state in the cheap final layer.
 # The mpfc account is already provisioned in the prepared system layer.
