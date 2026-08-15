@@ -49,7 +49,7 @@ jobs:
           from interop.mavsdk import standard_mode_from_native_name
           from interop.msp import standard_mode_from_native_names
 
-          assert occid.OCCID_SCHEMA_VERSION == (5, 2, 0)
+          assert occid.OCCID_SCHEMA_VERSION == (0, 0, 1)
           assert pwm_to_normalized(1000, 1000, 2000) == -1.0
           assert pwm_to_normalized(1500, 1000, 2000) == 0.0
           assert normalized_to_pwm(1.0, 1000, 2000) == 2000
