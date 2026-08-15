@@ -43,6 +43,20 @@ from lib.occid_topics import (
 )
 from lib.plugin_base import PluginBase
 from lib.state_scheduler import StateScheduler
+from lib.uav_semantics import (
+    DIRECT_CONTROL_MANUAL,
+    PARAM_TAKEOFF_ALTITUDE_M,
+    PROCESS_DIRECT_CONTROL,
+    PROCESS_DIRECT_CONTROL_MANUAL,
+    PROCESS_LAND,
+    PROCESS_RETURN_TO_LAUNCH,
+    PROCESS_TAKEOFF,
+    PROPERTY_ARMED,
+    PROPERTY_NATIVE_FLIGHT_MODE_CODE,
+    PROPERTY_NATIVE_FLIGHT_MODE_NAME,
+    PROPERTY_STANDARD_FLIGHT_MODE,
+    metadata_scalar,
+)
 
 REQUEST_QUEUE_TIMEOUT_S = 0.05
 POLL_INTERVAL_S = 0.1
@@ -123,7 +137,7 @@ class MspInterface(PluginBase):
         self.control_override: Any | None = None
         self.control_override_lock = threading.Lock()
         self.control_override_updated_at = 0.0
-        self.direct_control_mode: Any | None = None
+        self.direct_control_mode: str | None = None
         self.latest_flight_control: Any | None = None
         self.latest_location: Any | None = None
         self.latest_rc: Any | None = None
@@ -279,7 +293,7 @@ class MspInterface(PluginBase):
         if mode == occid.StandardFlightMode.CRUISE:
             return self._find_mode(("NAV CRUISE", "CRUISE"))
         raise UnsupportedCommand(
-            f"MSP mode command does not map standard mode {mode}; use dedicated flight actions for RTL/land/takeoff"
+            f"MSP mode command does not map standard mode {mode}; use dedicated semantic processes for RTL/land/takeoff"
         )
 
     def _set_standard_mode(self, mode: Any, enabled: bool) -> None:
@@ -321,7 +335,7 @@ class MspInterface(PluginBase):
 
     def _override_is_fresh(self) -> bool:
         return (
-            self.direct_control_mode == occid.DirectControlMode.MANUAL_AXIS
+            self.direct_control_mode == DIRECT_CONTROL_MANUAL
             and self.control_override is not None
             and time.monotonic() - self.control_override_updated_at <= float(self.control_override_timeout_s)
         )
@@ -554,9 +568,11 @@ class MspInterface(PluginBase):
             self._capture_loop_error("override_loop", exc)
 
     def _set_goto(self, command: Any) -> None:
-        position = command.position
+        position = command.destination
+        if position is None:
+            raise UnsupportedCommand("Motion MOVE_TO requires destination")
         if position.alt_frame != occid.AltitudeDatum.RELATIVE:
-            raise UnsupportedCommand(f"INAV GoTo currently requires RELATIVE altitude actual={position.alt_frame}")
+            raise UnsupportedCommand(f"INAV MOVE_TO currently requires RELATIVE altitude actual={position.alt_frame}")
         waypoint_index = int(self.go_to_waypoint["WaypointIndex"])
         action_enum = InavEnums.navWaypointActions_e(int(self.go_to_waypoint["Action"]))
         with self.api_lock:
@@ -572,35 +588,12 @@ class MspInterface(PluginBase):
                 flag=int(self.go_to_waypoint["Flag"]),
             )
 
-    def _set_waypoint(self, command: Any) -> None:
-        waypoint = command.waypoint
-        if waypoint.action_code is None:
-            raise UnsupportedCommand("SetWaypointCommand requires action_code for MSP")
-        if waypoint.position.alt_frame != occid.AltitudeDatum.RELATIVE:
+    def _begin_direct_control(self) -> None:
+        if self.direct_control_mode is not None and self.direct_control_mode != DIRECT_CONTROL_MANUAL:
             raise UnsupportedCommand(
-                f"MSP waypoint write currently requires RELATIVE altitude actual={waypoint.position.alt_frame}"
+                f"direct-control process already active mode={self.direct_control_mode}; stop it before switching"
             )
-        with self.api_lock:
-            self.api.set_waypoint(
-                waypointIndex=int(waypoint.waypoint_index),
-                action=InavEnums.navWaypointActions_e(int(waypoint.action_code)),
-                latitude=float(waypoint.position.lat),
-                longitude=float(waypoint.position.lon),
-                altitude=float(waypoint.position.alt),
-                param1=0 if waypoint.param1 is None else int(waypoint.param1),
-                param2=0 if waypoint.param2 is None else int(waypoint.param2),
-                param3=0 if waypoint.param3 is None else int(waypoint.param3),
-                flag=0 if waypoint.flag is None else int(waypoint.flag),
-            )
-
-    def _begin_direct_control(self, command: Any) -> None:
-        if command.mode != occid.DirectControlMode.MANUAL_AXIS:
-            raise UnsupportedCommand(f"MSP adapter supports MANUAL_AXIS direct control only actual={command.mode}")
-        if self.direct_control_mode is not None and self.direct_control_mode != command.mode:
-            raise UnsupportedCommand(
-                f"direct-control session already active mode={self.direct_control_mode}; end it before switching"
-            )
-        self.direct_control_mode = command.mode
+        self.direct_control_mode = DIRECT_CONTROL_MANUAL
         self._activate_override()
 
     def _end_direct_control(self) -> None:
@@ -613,8 +606,8 @@ class MspInterface(PluginBase):
     def _handle_input(self, payload: Any) -> None:
         model = decode_occid_input(payload)
         if isinstance(model, occid.ControlOverride):
-            if self.direct_control_mode != occid.DirectControlMode.MANUAL_AXIS:
-                self._publish_input_rejected(model, "ControlOverride requires active MANUAL_AXIS direct-control session")
+            if self.direct_control_mode != DIRECT_CONTROL_MANUAL:
+                self._publish_input_rejected(model, "ControlOverride requires active MANUAL_AXIS direct-control process")
                 return
             with self.control_override_lock:
                 self.control_override = model
@@ -622,49 +615,108 @@ class MspInterface(PluginBase):
             return
         self._publish_input_rejected(model, f"unsupported MSP direct input {type(model).__name__}")
 
-    def _handle_command(self, request: Dict[str, Any]) -> None:
-        request_id, command = decode_occid_command(request)
-        try:
-            if isinstance(command, occid.SetTakeoffAltitudeCommand):
-                self.takeoff_altitude_m = float(command.relative_altitude_m)
-            elif isinstance(command, occid.ReturnToLaunchCommand):
-                self._apply_mode(self._find_mode(("NAV RTH", "RTH", "NAV_RTH")))
-            elif isinstance(command, occid.SetModeCommand):
-                selectors = sum(
-                    selector is not None
-                    for selector in (command.standard_mode, command.native_mode_name, command.native_mode_code)
-                )
-                if selectors != 1:
-                    raise UnsupportedCommand("SetModeCommand requires exactly one standard/native selector")
-                if command.native_mode_name is not None:
-                    if command.enabled:
-                        self._apply_mode(str(command.native_mode_name))
-                    else:
-                        self._clear_mode(str(command.native_mode_name))
-                elif command.standard_mode is not None:
-                    self._set_standard_mode(command.standard_mode, bool(command.enabled))
-                else:
-                    raise UnsupportedCommand("MSP adapter does not support numeric native mode selection")
-            elif isinstance(command, occid.SetWaypointCommand):
-                self._set_waypoint(command)
-            elif isinstance(command, occid.SelectMissionCommand):
-                raise UnsupportedCommand("MSP exposes onboard mission state but does not provide a mission-bank selection primitive")
-            elif isinstance(command, occid.BeginDirectControlCommand):
-                self._begin_direct_control(command)
-            elif isinstance(command, occid.EndDirectControlCommand):
-                self._end_direct_control()
-            elif isinstance(command, occid.ArmCommand):
+    def _handle_state_change(self, command: Any) -> None:
+        name = command.property_name
+        if name == PROPERTY_ARMED:
+            if command.operation == occid.StateChangeOperation.SET:
+                value = metadata_scalar(command.value)
+                if type(value) is not bool:
+                    raise UnsupportedCommand("armed SET requires MetadataValue.bool")
+                armed = value
+            elif command.operation == occid.StateChangeOperation.ENABLE:
+                armed = True
+            elif command.operation == occid.StateChangeOperation.DISABLE:
+                armed = False
+            else:
+                raise UnsupportedCommand(f"unsupported armed operation {command.operation}")
+            if armed:
                 self._activate_override()
                 self._apply_mode(self.arm_mode_name)
                 self._set_throttle(self.rx_config["rxMinUsec"])
-            elif isinstance(command, occid.DisarmCommand):
+            else:
                 self._clear_mode(self.arm_mode_name)
-            elif isinstance(command, occid.TakeoffCommand):
+            return
+
+        enabled = command.operation != occid.StateChangeOperation.DISABLE
+        if name == PROPERTY_STANDARD_FLIGHT_MODE:
+            raw = metadata_scalar(command.value)
+            if type(raw) is not str or raw not in occid.StandardFlightMode.__members__:
+                raise UnsupportedCommand("standard_flight_mode requires a StandardFlightMode name")
+            self._set_standard_mode(occid.StandardFlightMode[raw], enabled)
+            return
+        if name == PROPERTY_NATIVE_FLIGHT_MODE_NAME:
+            raw = metadata_scalar(command.value)
+            if type(raw) is not str:
+                raise UnsupportedCommand("native_flight_mode_name requires MetadataValue.str")
+            if enabled:
+                self._apply_mode(raw)
+            else:
+                self._clear_mode(raw)
+            return
+        if name == PROPERTY_NATIVE_FLIGHT_MODE_CODE:
+            raise UnsupportedCommand("MSP adapter does not select native modes by numeric code")
+        raise UnsupportedCommand(f"unsupported MSP state property {name!r}")
+
+    def _handle_configuration(self, command: Any) -> None:
+        if (
+            command.operation == occid.ConfigurationOperation.SET_PARAMETER
+            and command.parameter_name == PARAM_TAKEOFF_ALTITUDE_M
+        ):
+            value = metadata_scalar(command.value)
+            if type(value) not in {int, float}:
+                raise UnsupportedCommand("takeoff_altitude_m requires numeric MetadataValue")
+            self.takeoff_altitude_m = float(value)
+            return
+        raise UnsupportedCommand(
+            f"unsupported MSP configuration operation={command.operation.name} parameter={command.parameter_name!r}"
+        )
+
+    def _handle_process_control(self, command: Any) -> None:
+        name = str(command.process_name or "")
+        if command.operation == occid.ProcessControlOperation.START:
+            if name == PROCESS_TAKEOFF:
                 self._takeoff()
-            elif isinstance(command, occid.LandCommand):
+                return
+            if name == PROCESS_LAND:
                 self._land()
-            elif isinstance(command, occid.GoToCommand):
-                self._set_goto(command)
+                return
+            if name == PROCESS_RETURN_TO_LAUNCH:
+                self._apply_mode(self._find_mode(("NAV RTH", "RTH", "NAV_RTH")))
+                return
+            if name == PROCESS_DIRECT_CONTROL_MANUAL:
+                self._begin_direct_control()
+                return
+        if command.operation == occid.ProcessControlOperation.STOP and name == PROCESS_DIRECT_CONTROL:
+            self._end_direct_control()
+            return
+        raise UnsupportedCommand(
+            f"unsupported MSP process operation={command.operation.name} process={name!r}"
+        )
+
+    def _handle_motion(self, command: Any) -> None:
+        if command.operation == occid.MotionOperation.MOVE_TO:
+            self._set_goto(command)
+            return
+        if command.operation in {occid.MotionOperation.MAINTAIN, occid.MotionOperation.STOP}:
+            self._set_standard_mode(occid.StandardFlightMode.POSITION_HOLD, True)
+            return
+        raise UnsupportedCommand(f"unsupported MSP motion operation {command.operation.name}")
+
+    def _handle_command(self, request: Dict[str, Any]) -> None:
+        request_id, command = decode_occid_command(request)
+        try:
+            if isinstance(command, occid.StateChangeCommand):
+                self._handle_state_change(command)
+            elif isinstance(command, occid.ProcessControlCommand):
+                self._handle_process_control(command)
+            elif isinstance(command, occid.ConfigurationCommand):
+                self._handle_configuration(command)
+            elif isinstance(command, occid.MotionCommand):
+                self._handle_motion(command)
+            elif isinstance(command, (occid.ResourceCommand, occid.ExecutionCommand)):
+                raise UnsupportedCommand(
+                    f"MSP adapter has no mapping for {type(command).__name__} operation={command.operation.name}"
+                )
             else:
                 raise UnsupportedCommand(f"unsupported OCCID UAV command {type(command).__name__}")
             self._respond(request_id, command, True)

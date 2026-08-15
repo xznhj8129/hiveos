@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """OCCID-native autonomous execution ingress for MPFC.
 
-Remote Plan, Task, Assignment, Execution, and execution-status models arrive as
+Remote Location, Plan, Task, Assignment, and Execution records arrive as
 canonical OCCID on the node-local ``OCCID/IN`` bridge topic. This plugin owns
 execution semantics; HiveLink owns only delivery and MPFC's MQTT bus remains
 private node-local IPC.
@@ -70,6 +70,26 @@ def _arrival_metrics(location: Any, destination: Any) -> tuple[float, float]:
     observed_altitude_m = _altitude_for_datum(location, destination.alt_frame)
     altitude_error_m = abs(observed_altitude_m - float(destination.alt))
     return horizontal_m, altitude_error_m
+
+
+def _location_identity(location: Any) -> Any:
+    for field_name in ("uid", "id", "location_id"):
+        value = getattr(location, field_name, None)
+        if isinstance(value, occid.StringID):
+            return value
+    raise ValueError(
+        f"Location record {type(location).__name__} has no stable StringID field"
+    )
+
+
+def _location_position(location: Any) -> Any:
+    for field_name in ("pos", "position"):
+        value = getattr(location, field_name, None)
+        if isinstance(value, occid.GlobalPosition):
+            return value
+    raise ValueError(
+        f"Location record {type(location).__name__} does not carry a GlobalPosition"
+    )
 
 
 @dataclass(frozen=True)
@@ -174,9 +194,6 @@ class ExecutionIngress(PluginBase):
             cfg.get("takeoff_altitude_ok_fraction", 0.8)
         )
         self.post_takeoff_wait_s = float(cfg.get("post_takeoff_wait_s", 1.0))
-        self.report_cache_size = int(cfg.get("report_cache_size", 128))
-        if self.report_cache_size < 1:
-            raise ValueError("report_cache_size must be at least 1")
 
         self.executor_id = occid.StringID.model_validate(cfg["executor_id"])
         self.asset_id = occid.StringID.model_validate(cfg["asset_id"])
@@ -184,7 +201,12 @@ class ExecutionIngress(PluginBase):
         self.out_topic = str(cfg.get("occid_out_topic", OCCID_OUT_TOPIC))
         self.client.subscribe(self.in_topic)
 
-        self.uav = UavClient(self, dict(cfg["interface"]), self.response_timeout_s)
+        self.uav = UavClient(
+            self,
+            dict(cfg["interface"]),
+            self.response_timeout_s,
+            target_ref=self.asset_id,
+        )
         self.init_bus(
             self.poll_interval_s,
             state_topics=self.uav.state_topics(),
@@ -193,7 +215,6 @@ class ExecutionIngress(PluginBase):
 
         self.records: dict[tuple[str, str, str], Any] = {}
         self.pending_executions: dict[tuple[str, str], Any] = {}
-        self.latest_reports: dict[str, Any] = {}
         self.active_execution_id: Any | None = None
         self.active_dispatch_id: str | None = None
         self.lifecycle_state = "STARTING"
@@ -210,6 +231,7 @@ class ExecutionIngress(PluginBase):
         if remote is not None:
             data["dispatch_id"] = remote.dispatch_id
             data["execution_id"] = _id_text(remote.bundle.execution.execution_id)
+            data["task_instruction"] = remote.bundle.task.instruction
         if detail:
             data["detail"] = str(detail)
         self.client.publish(
@@ -218,7 +240,10 @@ class ExecutionIngress(PluginBase):
         )
         suffix = ""
         if remote is not None:
-            suffix = f" dispatch_id={remote.dispatch_id}"
+            suffix = (
+                f" dispatch_id={remote.dispatch_id} "
+                f"task={type(remote.bundle.task).__name__}:{remote.bundle.task.intent.name}"
+            )
         if detail:
             suffix += f" detail={detail}"
         print(
@@ -265,13 +290,6 @@ class ExecutionIngress(PluginBase):
             reported_at=time.time(),
         )
         self._send_model(dest, report)
-
-    def _remember_report(self, dispatch_id: str, report: Any) -> None:
-        self.latest_reports.pop(dispatch_id, None)
-        self.latest_reports[dispatch_id] = report
-        while len(self.latest_reports) > self.report_cache_size:
-            oldest = next(iter(self.latest_reports))
-            self.latest_reports.pop(oldest, None)
 
     def _record_meta(self, bundle: ExecutionBundle) -> Any:
         now = time.time()
@@ -348,11 +366,14 @@ class ExecutionIngress(PluginBase):
             failure=failure,
             reported_at=time.time(),
         )
-        self._remember_report(dispatch_id, report)
         self._send_model(dest, report)
         return report
 
     def _store_model(self, source: str, model: Any) -> bool:
+        if isinstance(model, occid.Location):
+            location_id = _location_identity(model)
+            self.records[(source, "location", _id_key(location_id))] = model
+            return True
         if isinstance(model, occid.Plan):
             self.records[(source, "plan", _id_key(model.plan_id))] = model
             return True
@@ -367,6 +388,40 @@ class ExecutionIngress(PluginBase):
             self.pending_executions[(source, dispatch_id)] = model
             return True
         return False
+
+    def _move_dependency_missing(self, source: str, task: Any) -> bool:
+        if not isinstance(task, occid.TaskManeuver):
+            return False
+        if task.intent != occid.ManeuverIntent.MOVE:
+            return False
+        if len(task.location_refs) != 1:
+            return False
+        return (
+            source,
+            "location",
+            _id_key(task.location_refs[0]),
+        ) not in self.records
+
+    def _resolve_move_destination(self, source: str, task: Any) -> Any:
+        if not isinstance(task, occid.TaskManeuver):
+            raise TypeError(
+                f"no local handler for {type(task).__name__}; current handler is TaskManeuver/MOVE"
+            )
+        if task.intent != occid.ManeuverIntent.MOVE:
+            raise TypeError(
+                f"no local handler for TaskManeuver/{task.intent.name}; current handler is MOVE"
+            )
+        if len(task.location_refs) != 1:
+            raise ValueError(
+                f"TaskManeuver/MOVE requires exactly one location_ref; got {len(task.location_refs)}"
+            )
+        location_ref = task.location_refs[0]
+        location = self.records.get((source, "location", _id_key(location_ref)))
+        if location is None:
+            raise ValueError(
+                f"TaskManeuver/MOVE location_ref is unresolved: {_id_text(location_ref)}"
+            )
+        return _location_position(location)
 
     def _assemble_ready(self, source: str) -> list[RemoteExecution]:
         ready: list[RemoteExecution] = []
@@ -385,6 +440,8 @@ class ExecutionIngress(PluginBase):
                 continue
             plan = self.records.get((source, "plan", _id_key(assignment.plan_id)))
             if plan is None:
+                continue
+            if self._move_dependency_missing(source, task):
                 continue
 
             self.pending_executions.pop((source, dispatch_id), None)
@@ -409,28 +466,6 @@ class ExecutionIngress(PluginBase):
             )
         return ready
 
-    def _handle_status_request(self, source: str, request: Any) -> None:
-        dispatch_id = str(request.dispatch_id.value)
-        retained = self.latest_reports.get(dispatch_id)
-        found = (
-            retained is not None
-            and retained.execution_id == request.execution_id
-        )
-        if found:
-            self._send_model(source, retained)
-            return
-        self._send_model(
-            source,
-            occid.ExecutionStatusReport(
-                execution_id=request.execution_id,
-                dispatch_id=request.dispatch_id,
-                executor_id=self.executor_id,
-                found=False,
-                phase=None,
-                reported_at=time.time(),
-            ),
-        )
-
     def _ingest_occid(self, envelope: Dict[str, Any]) -> list[RemoteExecution]:
         data = envelope.get("data")
         if type(data) is not dict:
@@ -439,10 +474,6 @@ class ExecutionIngress(PluginBase):
         if not source:
             raise ValueError("OCCID/IN is missing source node id")
         model = unpack_occid(data["model"])
-
-        if isinstance(model, occid.ExecutionStatusRequest):
-            self._handle_status_request(source, model)
-            return []
         if not self._store_model(source, model):
             return []
         return self._assemble_ready(source)
@@ -501,26 +532,26 @@ class ExecutionIngress(PluginBase):
             return None
         return location.altitude.relative_m
 
-    def _prepare_vehicle_for_move(self, task: Any) -> None:
+    def _prepare_vehicle_for_move(self, destination: Any) -> None:
         flight = self.uav.flight_control()
         if flight is not None and bool(flight.in_air):
             return
         if not self.auto_takeoff_for_move:
             raise RuntimeError(
-                "MoveTask requires an airborne vehicle when auto_takeoff_for_move is false"
+                "TaskManeuver/MOVE requires an airborne vehicle when auto_takeoff_for_move is false"
             )
 
         takeoff_altitude_m = self.takeoff_altitude_m
         if (
-            task.destination.alt_frame == occid.AltitudeDatum.RELATIVE
-            and float(task.destination.alt) > 0.0
+            destination.alt_frame == occid.AltitudeDatum.RELATIVE
+            and float(destination.alt) > 0.0
         ):
-            takeoff_altitude_m = min(takeoff_altitude_m, float(task.destination.alt))
+            takeoff_altitude_m = min(takeoff_altitude_m, float(destination.alt))
         if takeoff_altitude_m <= 0.0:
-            raise RuntimeError("MoveTask automatic takeoff altitude must be positive")
+            raise RuntimeError("TaskManeuver/MOVE automatic takeoff altitude must be positive")
 
         self.uav.execute(
-            occid.SetTakeoffAltitudeCommand(relative_altitude_m=takeoff_altitude_m),
+            self.uav.takeoff_altitude_command(takeoff_altitude_m),
             timeout_s=self.response_timeout_s,
         )
         self._wait_until(
@@ -535,7 +566,10 @@ class ExecutionIngress(PluginBase):
 
         flight = self.uav.flight_control()
         if flight is None or not bool(flight.armed):
-            self.uav.execute(occid.ArmCommand(), timeout_s=self.response_timeout_s)
+            self.uav.execute(
+                self.uav.arm_command(True),
+                timeout_s=self.response_timeout_s,
+            )
             self._wait_until(
                 lambda: (
                     self.uav.flight_control() is not None
@@ -555,7 +589,10 @@ class ExecutionIngress(PluginBase):
             self.state_timeout_s,
             "timed out waiting for UAV takeoff readiness",
         )
-        self.uav.execute(occid.TakeoffCommand(), timeout_s=self.response_timeout_s)
+        self.uav.execute(
+            self.uav.takeoff_command(),
+            timeout_s=self.response_timeout_s,
+        )
         self._wait_until(
             lambda: (
                 self.uav.flight_control() is not None
@@ -572,20 +609,14 @@ class ExecutionIngress(PluginBase):
             while time.monotonic() < deadline:
                 self._pump_with_ingress(deadline)
 
-    def _execute_move(self, remote: RemoteExecution) -> None:
+    def _execute_move(self, remote: RemoteExecution, destination: Any) -> None:
         bundle = remote.bundle
-        task = bundle.task
-        if not isinstance(task, occid.MoveTask):
-            raise TypeError(
-                f"unsupported task handler {type(task).__name__}; current handler is MoveTask"
-            )
-
         self._wait_for_location(self.state_timeout_s)
-        self._prepare_vehicle_for_move(task)
+        self._prepare_vehicle_for_move(destination)
         current = self._wait_for_location(self.state_timeout_s)
         initial_distance_m, initial_altitude_error_m = _arrival_metrics(
             current,
-            task.destination,
+            destination,
         )
         horizontal_denominator = max(initial_distance_m, self.arrival_radius_m, 0.01)
         altitude_denominator = max(
@@ -594,8 +625,15 @@ class ExecutionIngress(PluginBase):
             0.01,
         )
 
-        command = occid.GoToCommand(position=task.destination)
-        self.uav.execute(command, timeout_s=self.response_timeout_s)
+        self.uav.execute(
+            self.uav.go_to_command(
+                float(destination.lat),
+                float(destination.lon),
+                float(destination.alt),
+                altitude_datum=destination.alt_frame,
+            ),
+            timeout_s=self.response_timeout_s,
+        )
         running = self._task_delta(bundle, occid.TaskPhase.RUNNING, progress=0.0)
         self._publish_status(
             remote.source,
@@ -614,7 +652,7 @@ class ExecutionIngress(PluginBase):
             if current is not None and current.position is not None:
                 horizontal_m, altitude_error_m = _arrival_metrics(
                     current,
-                    task.destination,
+                    destination,
                 )
                 remaining_fraction = max(
                     horizontal_m / horizontal_denominator,
@@ -661,7 +699,7 @@ class ExecutionIngress(PluginBase):
 
             if time.monotonic() > deadline:
                 raise RuntimeError(
-                    f"MoveTask timed out after {self.execution_timeout_s:.1f}s without arrival"
+                    f"TaskManeuver/MOVE timed out after {self.execution_timeout_s:.1f}s without arrival"
                 )
             self._pump_with_ingress(
                 min(deadline, time.monotonic() + self.poll_interval_s)
@@ -681,14 +719,16 @@ class ExecutionIngress(PluginBase):
                     "Assignment.assignee_id does not address this asset: "
                     f"{_id_text(bundle.assignment.assignee_id)} != {_id_text(self.asset_id)}"
                 )
-            if not isinstance(bundle.task, occid.MoveTask):
-                raise TypeError(
-                    f"no local handler for {type(bundle.task).__name__}; current handler is MoveTask"
-                )
+            destination = self._resolve_move_destination(remote.source, bundle.task)
 
             self.active_execution_id = bundle.execution.execution_id
             self.active_dispatch_id = remote.dispatch_id
             self._set_lifecycle("EXECUTING", remote)
+            print(
+                f"[TASK] instruction={bundle.task.instruction!r} "
+                f"location_ref={_id_text(bundle.task.location_refs[0])}",
+                flush=True,
+            )
             self._send_acceptance(
                 remote.source,
                 bundle.execution,
@@ -711,7 +751,7 @@ class ExecutionIngress(PluginBase):
                 progress=0.0,
             )
 
-            self._execute_move(remote)
+            self._execute_move(remote, destination)
         except Exception as exc:
             if not semantic_accepted:
                 self._send_acceptance(

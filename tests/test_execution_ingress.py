@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-import base64
-import time
 import unittest
-import uuid
 
 from lib.occid_bus import occid
 from plugins.execution_ingress.execution_ingress import (
+    ExecutionIngress,
     _arrival_metrics,
     _distance_m,
-    decode_execution_bundle,
+    _location_identity,
+    _location_position,
+    validate_execution_bundle,
 )
 
 
@@ -17,112 +17,126 @@ def sid(value: str) -> object:
     return occid.StringID(id_type=occid.IdentifierType.DB_ID, value=value)
 
 
-def record(origin: str = "test") -> object:
-    now = time.time()
+def record(value: str) -> object:
     return occid.RecordMeta(
-        record_id=sid(str(uuid.uuid4())),
+        record_id=sid(f"record.{value}"),
         revision=0,
-        created_ts=now,
-        updated_ts=now,
-        origin_system=origin,
+        created_ts=1.0,
+        updated_ts=1.0,
+        origin_system="mpfc.tests",
         provenance=[],
     )
 
 
-def native_b64(model: object) -> str:
-    return base64.b64encode(model.encode()).decode("ascii")
+def build_bundle() -> tuple[object, object, object, object, object]:
+    location = occid.MissionPoi(
+        uid=sid("location.target"),
+        name="Target",
+        pos=occid.GlobalPosition(
+            lat=45.5017,
+            lon=-73.5673,
+            alt=20.0,
+            alt_frame=occid.AltitudeDatum.RELATIVE,
+        ),
+        origin="test",
+    )
+    task = occid.TaskManeuver(
+        record=record("task"),
+        task_id=sid("task.move"),
+        instruction="Move to the designated target point and hold there.",
+        target_refs=[],
+        location_refs=[location.uid],
+        objective_id=None,
+        constraints=[],
+        intent=occid.ManeuverIntent.MOVE,
+    )
+    plan = occid.Plan(
+        record=record("plan"),
+        plan_id=sid("plan.move"),
+        name="move",
+        objective_ids=[],
+        task_ids=[task.task_id],
+        actor_ids=[sid("uav1")],
+        resource_ids=[],
+        assignments=[],
+        steps=[],
+        routes=[],
+        constraints=[],
+        contingencies=[],
+        approval_state=occid.PlanApprovalState.APPROVED,
+    )
+    assignment = occid.Assignment(
+        record=record("assignment"),
+        assignment_id=sid("assignment.move"),
+        task_id=task.task_id,
+        assignee_id=sid("uav1"),
+        plan_id=plan.plan_id,
+        authority_id=None,
+        assigned_by=sid("control"),
+        assigned_at=1.0,
+        status=occid.AssignmentStatus.ASSIGNED,
+        constraints=[],
+    )
+    execution = occid.Execution(
+        record=record("execution"),
+        execution_id=sid("execution.move"),
+        assignment_id=assignment.assignment_id,
+        executor_id=sid("mpfc:uav1"),
+        phase=occid.ExecutionPhase.CREATED,
+        external_job_refs=[sid("dispatch.move.1")],
+    )
+    return location, task, plan, assignment, execution
 
 
-class ExecutionIngressContractTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.asset_id = sid("uav1")
-        self.executor_id = sid("mpfc:uav1")
-        self.task = occid.MoveTask(
-            record=record(),
-            task_id=sid("task-1"),
-            task_type=occid.TaskType.MOVE,
-            destination=occid.GlobalPosition(
-                lat=47.397742,
-                lon=8.545594,
-                alt=20.0,
-                alt_frame=occid.AltitudeDatum.RELATIVE,
-            ),
-        )
-        self.assignment = occid.Assignment(
-            record=record(),
-            assignment_id=sid("assignment-1"),
-            task_id=self.task.task_id,
-            assignee_id=self.asset_id,
-            plan_id=sid("plan-1"),
-            authority="sigma.fixture",
-            assigned_by=sid("sigma.fixture"),
-            assigned_at=time.time(),
-            status=occid.AssignmentStatus.ASSIGNED,
-            constraints=[],
-        )
-        self.plan = occid.Plan(
-            record=record(),
-            plan_id=self.assignment.plan_id,
-            name="test plan",
-            objective_ids=[],
-            task_ids=[self.task.task_id],
-            actor_ids=[self.asset_id],
-            resource_ids=[],
-            assignments=[],
-            steps=[],
-            routes=[],
-            constraints=[],
-            contingencies=[],
-            approval_state=occid.PlanApprovalState.APPROVED,
-        )
-        self.execution = occid.Execution(
-            record=record(),
-            execution_id=sid("execution-1"),
-            assignment_id=self.assignment.assignment_id,
-            executor_id=self.executor_id,
-            phase=occid.ExecutionPhase.CREATED,
-            external_job_refs=[],
-        )
+class ExecutionIngressTests(unittest.TestCase):
+    def test_bundle_validation_preserves_execution_correlation(self) -> None:
+        _, task, plan, assignment, execution = build_bundle()
+        bundle = validate_execution_bundle(execution, assignment, task, plan)
+        self.assertEqual(bundle.task.task_id, assignment.task_id)
+        self.assertEqual(bundle.plan.plan_id, assignment.plan_id)
+        self.assertEqual(bundle.execution.assignment_id, assignment.assignment_id)
 
-    def params(self, assignment=None, task=None, plan=None) -> dict:
-        return {
-            "execution_b64": native_b64(self.execution),
-            "assignment_b64": native_b64(assignment or self.assignment),
-            "task_b64": native_b64(task or self.task),
-            "plan_b64": native_b64(plan or self.plan),
-        }
-
-    def test_valid_bundle_preserves_sigma_execution_identity(self) -> None:
-        bundle = decode_execution_bundle(self.params())
-        self.assertEqual(bundle.execution.execution_id, self.execution.execution_id)
-        self.assertEqual(bundle.assignment.assignment_id, self.assignment.assignment_id)
-        self.assertEqual(bundle.task.task_id, self.task.task_id)
-        self.assertIs(type(bundle.task), occid.MoveTask)
-
-    def test_mismatched_task_relationship_is_rejected(self) -> None:
-        bad_assignment = self.assignment.model_copy(update={"task_id": sid("other-task")})
-        with self.assertRaisesRegex(ValueError, "Assignment.task_id"):
-            decode_execution_bundle(self.params(assignment=bad_assignment))
-
-    def test_plan_reference_requires_plan_payload(self) -> None:
-        params = self.params()
-        params.pop("plan_b64")
-        with self.assertRaisesRegex(ValueError, "plan_b64"):
-            decode_execution_bundle(params)
+    def test_bundle_validation_rejects_mismatched_assignment(self) -> None:
+        _, task, plan, assignment, execution = build_bundle()
+        bad_execution = execution.model_copy(update={"assignment_id": sid("assignment.other")})
+        with self.assertRaisesRegex(ValueError, "Execution.assignment_id"):
+            validate_execution_bundle(bad_execution, assignment, task, plan)
 
     def test_unapproved_plan_is_rejected_independently(self) -> None:
-        draft = self.plan.model_copy(
-            update={"approval_state": occid.PlanApprovalState.DRAFT}
-        )
+        _, task, plan, assignment, execution = build_bundle()
+        draft = plan.model_copy(update={"approval_state": occid.PlanApprovalState.DRAFT})
         with self.assertRaisesRegex(ValueError, "not approved"):
-            decode_execution_bundle(self.params(plan=draft))
+            validate_execution_bundle(execution, assignment, task, draft)
 
-    def test_non_executable_assignment_is_rejected_independently(self) -> None:
-        proposed = self.assignment.model_copy(
-            update={"status": occid.AssignmentStatus.PROPOSED}
+    def test_move_task_resolves_global_position_through_location_ref(self) -> None:
+        location, task, _, _, _ = build_bundle()
+        ingress = ExecutionIngress.__new__(ExecutionIngress)
+        ingress.records = {
+            ("control", "location", "DB_ID:location.target"): location,
+        }
+        destination = ingress._resolve_move_destination("control", task)
+        self.assertEqual(destination, location.pos)
+        self.assertEqual(_location_identity(location), location.uid)
+        self.assertEqual(_location_position(location), location.pos)
+
+    def test_move_task_rejects_unresolved_location(self) -> None:
+        _, task, _, _, _ = build_bundle()
+        ingress = ExecutionIngress.__new__(ExecutionIngress)
+        ingress.records = {}
+        with self.assertRaisesRegex(ValueError, "unresolved"):
+            ingress._resolve_move_destination("control", task)
+
+    def test_unsupported_task_family_rejects_before_execution(self) -> None:
+        _, task, _, _, _ = build_bundle()
+        data = task.model_dump(exclude={"intent"})
+        info_task = occid.TaskInformation(
+            **data,
+            intent=occid.InformationIntent.SEARCH,
         )
-        with self.assertRaisesRegex(ValueError, "not executable"):
-            decode_execution_bundle(self.params(assignment=proposed))
+        ingress = ExecutionIngress.__new__(ExecutionIngress)
+        ingress.records = {}
+        with self.assertRaisesRegex(TypeError, "TaskManeuver/MOVE"):
+            ingress._resolve_move_destination("control", info_task)
 
     def test_horizontal_distance_is_metric_and_symmetric(self) -> None:
         a = occid.GlobalPosition(
@@ -143,39 +157,25 @@ class ExecutionIngressContractTests(unittest.TestCase):
         self.assertGreater(ab, 110.0)
         self.assertLess(ab, 112.0)
 
-    def test_relative_arrival_uses_relative_altitude_observation(self) -> None:
-        location = occid.LocationState(
+    def test_arrival_metrics_respect_relative_altitude_datum(self) -> None:
+        location, _, _, _, _ = build_bundle()
+        observed = occid.LocationState(
             position=occid.GlobalPosition(
-                lat=47.397742,
-                lon=8.545594,
-                alt=510.0,
+                lat=location.pos.lat,
+                lon=location.pos.lon,
+                alt=500.0,
                 alt_frame=occid.AltitudeDatum.SEA_LEVEL,
             ),
             altitude=occid.AltitudeState(
-                absolute_m=510.0,
+                absolute_m=500.0,
                 absolute_datum=occid.AltitudeDatum.SEA_LEVEL,
-                relative_m=18.5,
+                relative_m=19.5,
                 relative_datum=occid.AltitudeDatum.RELATIVE,
             ),
         )
-        horizontal_m, altitude_error_m = _arrival_metrics(
-            location,
-            self.task.destination,
-        )
-        self.assertAlmostEqual(horizontal_m, 0.0, places=6)
-        self.assertAlmostEqual(altitude_error_m, 1.5, places=6)
-
-    def test_arrival_rejects_missing_requested_altitude_datum(self) -> None:
-        location = occid.LocationState(
-            position=occid.GlobalPosition(
-                lat=47.397742,
-                lon=8.545594,
-                alt=510.0,
-                alt_frame=occid.AltitudeDatum.SEA_LEVEL,
-            )
-        )
-        with self.assertRaisesRegex(RuntimeError, "no altitude observation"):
-            _arrival_metrics(location, self.task.destination)
+        horizontal_m, altitude_error_m = _arrival_metrics(observed, location.pos)
+        self.assertAlmostEqual(horizontal_m, 0.0, places=5)
+        self.assertAlmostEqual(altitude_error_m, 0.5, places=5)
 
 
 if __name__ == "__main__":

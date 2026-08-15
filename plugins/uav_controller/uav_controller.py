@@ -2,9 +2,9 @@
 """OCCID-native UAV service plugin.
 
 Programs talk to this plugin as the stable UAV API. It applies reusable
-vehicle-level policy, type-gates immediate UAV command families, forwards
-commands without blocking on endpoint mechanics, and relays high-rate OCCID
-Input samples on a latest-value path.
+vehicle-level policy, type-gates concrete generic OCCID Command families,
+forwards commands without blocking on endpoint mechanics, and relays high-rate
+OCCID Input samples on a latest-value path.
 """
 
 from __future__ import annotations
@@ -36,13 +36,15 @@ from lib.plugin_base import PluginBase
 
 
 class UavController(PluginBase):
-    """Backend-independent UAV service built on OCCID commands, inputs, and state."""
+    """Backend-independent UAV service built on OCCID Commands, Inputs, and State."""
 
     IMMEDIATE_COMMAND_TYPES = (
-        occid.FlightCommand,
-        occid.NavigationCommand,
-        occid.ModeCommand,
-        occid.DirectControlCommand,
+        occid.StateChangeCommand,
+        occid.ProcessControlCommand,
+        occid.ConfigurationCommand,
+        occid.MotionCommand,
+        occid.ResourceCommand,
+        occid.ExecutionCommand,
     )
     DIRECT_INPUT_TYPES = (
         occid.ControlAttitudeSetpoint,
@@ -58,6 +60,16 @@ class UavController(PluginBase):
         self.backend = dict(cfg["backend"])
         self.backend_state_keys = list(cfg["backend_state_keys"])
         self.backend_event_keys = list(cfg.get("backend_event_keys", []))
+        raw_target = cfg.get("target_ref")
+        if raw_target is None:
+            topic_prefix = str(bus_config.get("topic_prefix", ""))
+            if not topic_prefix.startswith("mpfc/") or topic_prefix.count("/") != 1:
+                raise ValueError("uav_controller requires target_ref or an mpfc/<asset> topic prefix")
+            raw_target = {
+                "id_type": "DB_ID",
+                "value": topic_prefix.split("/", 1)[1],
+            }
+        self.target_ref = occid.StringID.model_validate(raw_target)
         self.arm_ready_since: float | None = None
         self.takeoff_ready_since: float | None = None
         self.backend_flight_control: Any | None = None
@@ -220,10 +232,16 @@ class UavController(PluginBase):
         try:
             request_id, command = decode_occid_command(request)
             command_name = type(command).__name__
-            if not isinstance(command, self.IMMEDIATE_COMMAND_TYPES):
+            if type(command) not in self.IMMEDIATE_COMMAND_TYPES:
                 allowed = ", ".join(command_type.__name__ for command_type in self.IMMEDIATE_COMMAND_TYPES)
                 raise TypeError(
-                    f"uav_controller accepts immediate UAV command families only allowed={allowed} actual={command_name}"
+                    f"uav_controller accepts concrete OCCID Command families only "
+                    f"allowed={allowed} actual={command_name}"
+                )
+            if command.target_ref != self.target_ref:
+                raise ValueError(
+                    f"command target_ref does not address this UAV "
+                    f"expected={self.target_ref} actual={command.target_ref}"
                 )
             backend_request_id = send_occid_command(self.bus, self.backend_request_topic, command)
             self.pending_backend_requests[backend_request_id] = (

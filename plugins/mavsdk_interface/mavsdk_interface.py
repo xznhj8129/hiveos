@@ -44,6 +44,22 @@ from lib.occid_topics import (
 )
 from lib.plugin_base import PluginBase
 from lib.state_scheduler import StateScheduler
+from lib.uav_semantics import (
+    DIRECT_CONTROL_ATTITUDE,
+    DIRECT_CONTROL_MANUAL,
+    PARAM_TAKEOFF_ALTITUDE_M,
+    PROCESS_DIRECT_CONTROL,
+    PROCESS_DIRECT_CONTROL_ATTITUDE,
+    PROCESS_DIRECT_CONTROL_MANUAL,
+    PROCESS_LAND,
+    PROCESS_RETURN_TO_LAUNCH,
+    PROCESS_TAKEOFF,
+    PROPERTY_ARMED,
+    PROPERTY_NATIVE_FLIGHT_MODE_CODE,
+    PROPERTY_NATIVE_FLIGHT_MODE_NAME,
+    PROPERTY_STANDARD_FLIGHT_MODE,
+    metadata_scalar,
+)
 
 REQUEST_QUEUE_TIMEOUT_S = 0.05
 POLL_INTERVAL_S = 0.1
@@ -112,7 +128,7 @@ class MavsdkInterface(PluginBase):
         self.control_override: Any | None = None
         self.control_override_lock = threading.Lock()
         self.control_override_updated_at = 0.0
-        self.direct_control_mode: Any | None = None
+        self.direct_control_mode: str | None = None
         self.manual_control_started = False
         self.offboard_attitude_started = False
 
@@ -143,7 +159,7 @@ class MavsdkInterface(PluginBase):
         )
 
     def _override_is_fresh(self) -> bool:
-        if self.direct_control_mode != occid.DirectControlMode.MANUAL_AXIS or self.control_override is None:
+        if self.direct_control_mode != DIRECT_CONTROL_MANUAL or self.control_override is None:
             return False
         return time.monotonic() - self.control_override_updated_at <= float(self.control_override_timeout_s)
 
@@ -202,33 +218,27 @@ class MavsdkInterface(PluginBase):
                 rejected = locals().get("model", payload)
                 self._publish_input_rejected(rejected, str(exc))
 
-    async def _handle_set_mode(self, command: Any) -> None:
-        selectors = sum(
-            selector is not None
-            for selector in (command.standard_mode, command.native_mode_name, command.native_mode_code)
-        )
-        if selectors != 1:
-            raise UnsupportedCommand("SetModeCommand requires exactly one standard/native selector")
-        if not command.enabled:
+    async def _set_standard_mode(self, mode: Any, enabled: bool) -> None:
+        if not enabled:
             raise UnsupportedCommand("MAVSDK adapter cannot generically deactivate an arbitrary mode")
-        if command.native_mode_name is not None or command.native_mode_code is not None:
-            raise UnsupportedCommand("MAVSDK adapter does not expose arbitrary native mode selection")
-        if command.standard_mode == occid.StandardFlightMode.POSITION_HOLD:
+        if mode == occid.StandardFlightMode.POSITION_HOLD:
             await self.drone.action.hold()
             return
         raise UnsupportedCommand(
-            f"MAVSDK adapter does not map standard mode {command.standard_mode}; "
-            "use dedicated flight actions for takeoff/land/RTL"
+            f"MAVSDK adapter does not map standard mode {mode}; "
+            "use dedicated semantic processes for takeoff/land/RTL"
         )
 
-    async def _begin_direct_control(self, command: Any) -> None:
-        if command.mode == occid.DirectControlMode.MANUAL_AXIS and not self.consume_control_override:
+    async def _begin_direct_control(self, mode: str) -> None:
+        if mode == DIRECT_CONTROL_MANUAL and not self.consume_control_override:
             raise UnsupportedCommand("MANUAL_AXIS direct control is disabled by adapter configuration")
-        if self.direct_control_mode is not None and self.direct_control_mode != command.mode:
+        if mode not in {DIRECT_CONTROL_ATTITUDE, DIRECT_CONTROL_MANUAL}:
+            raise UnsupportedCommand(f"unsupported direct-control process mode={mode}")
+        if self.direct_control_mode is not None and self.direct_control_mode != mode:
             raise UnsupportedCommand(
-                f"direct-control session already active mode={self.direct_control_mode}; end it before switching"
+                f"direct-control process already active mode={self.direct_control_mode}; stop it before switching"
             )
-        self.direct_control_mode = command.mode
+        self.direct_control_mode = mode
 
     async def _end_direct_control(self) -> None:
         if self.offboard_attitude_started:
@@ -241,10 +251,105 @@ class MavsdkInterface(PluginBase):
             self.control_override_updated_at = 0.0
         self._publish_flight_control(override_active=False, attitude_setpoint=None)
 
+    async def _handle_state_change(self, command: Any) -> None:
+        name = command.property_name
+        if name == PROPERTY_ARMED:
+            if command.operation == occid.StateChangeOperation.SET:
+                value = metadata_scalar(command.value)
+                if type(value) is not bool:
+                    raise UnsupportedCommand("armed SET requires MetadataValue.bool")
+                armed = value
+            elif command.operation == occid.StateChangeOperation.ENABLE:
+                armed = True
+            elif command.operation == occid.StateChangeOperation.DISABLE:
+                armed = False
+            else:
+                raise UnsupportedCommand(f"unsupported armed operation {command.operation}")
+            if armed:
+                await self.drone.action.arm()
+            else:
+                await self.drone.action.disarm()
+            return
+
+        if name == PROPERTY_STANDARD_FLIGHT_MODE:
+            raw = metadata_scalar(command.value)
+            if type(raw) is not str or raw not in occid.StandardFlightMode.__members__:
+                raise UnsupportedCommand("standard_flight_mode requires a StandardFlightMode name")
+            await self._set_standard_mode(
+                occid.StandardFlightMode[raw],
+                command.operation != occid.StateChangeOperation.DISABLE,
+            )
+            return
+        if name in {PROPERTY_NATIVE_FLIGHT_MODE_NAME, PROPERTY_NATIVE_FLIGHT_MODE_CODE}:
+            raise UnsupportedCommand("MAVSDK adapter does not expose arbitrary native mode selection")
+        raise UnsupportedCommand(f"unsupported MAVSDK state property {name!r}")
+
+    async def _handle_process_control(self, command: Any) -> None:
+        name = str(command.process_name or "")
+        if command.operation == occid.ProcessControlOperation.START:
+            if name == PROCESS_TAKEOFF:
+                await self.drone.action.takeoff()
+                return
+            if name == PROCESS_LAND:
+                await self.drone.action.land()
+                return
+            if name == PROCESS_RETURN_TO_LAUNCH:
+                await self.drone.action.return_to_launch()
+                return
+            if name == PROCESS_DIRECT_CONTROL_ATTITUDE:
+                await self._begin_direct_control(DIRECT_CONTROL_ATTITUDE)
+                return
+            if name == PROCESS_DIRECT_CONTROL_MANUAL:
+                await self._begin_direct_control(DIRECT_CONTROL_MANUAL)
+                return
+        if command.operation == occid.ProcessControlOperation.STOP and name == PROCESS_DIRECT_CONTROL:
+            await self._end_direct_control()
+            return
+        raise UnsupportedCommand(
+            f"unsupported MAVSDK process operation={command.operation.name} process={name!r}"
+        )
+
+    async def _handle_configuration(self, command: Any) -> None:
+        if (
+            command.operation == occid.ConfigurationOperation.SET_PARAMETER
+            and command.parameter_name == PARAM_TAKEOFF_ALTITUDE_M
+        ):
+            value = metadata_scalar(command.value)
+            if type(value) not in {int, float}:
+                raise UnsupportedCommand("takeoff_altitude_m requires numeric MetadataValue")
+            await self.drone.action.set_takeoff_altitude(float(value))
+            return
+        raise UnsupportedCommand(
+            f"unsupported MAVSDK configuration operation={command.operation.name} "
+            f"parameter={command.parameter_name!r}"
+        )
+
+    async def _handle_motion(self, command: Any) -> None:
+        if command.operation == occid.MotionOperation.MOVE_TO:
+            fields = goto_command_to_fields(
+                command,
+                current_absolute_altitude_m=self.last_abs_alt_m,
+                current_relative_altitude_m=self.last_rel_alt_m,
+                current_yaw_rad=(
+                    None if self.last_attitude is None else float(self.last_attitude.yaw_rad)
+                ),
+            )
+            await self.drone.action.goto_location(
+                fields.latitude_deg,
+                fields.longitude_deg,
+                fields.absolute_altitude_m,
+                fields.yaw_deg,
+            )
+            return
+        if command.operation in {occid.MotionOperation.MAINTAIN, occid.MotionOperation.STOP}:
+            await self.drone.action.hold()
+            return
+        raise UnsupportedCommand(f"unsupported MAVSDK motion operation {command.operation.name}")
+
     async def _handle_input(self, model: Any) -> None:
         if isinstance(model, occid.ControlAttitudeSetpoint):
-            if self.direct_control_mode != occid.DirectControlMode.ATTITUDE_THRUST:
-                raise UnsupportedCommand("ControlAttitudeSetpoint requires active ATTITUDE_THRUST direct-control session")
+            if self.direct_control_mode != DIRECT_CONTROL_ATTITUDE:
+                raise UnsupportedCommand("ControlAttitudeSetpoint requires active ATTITUDE_THRUST direct-control process")
             fields = attitude_setpoint_to_fields(model)
             await self.drone.offboard.set_attitude(
                 Attitude(fields.roll_deg, fields.pitch_deg, fields.yaw_deg, fields.thrust_value)
@@ -255,8 +360,8 @@ class MavsdkInterface(PluginBase):
             self._publish_flight_control(attitude_setpoint=model, override_active=True)
             return
         if isinstance(model, occid.ControlOverride):
-            if self.direct_control_mode != occid.DirectControlMode.MANUAL_AXIS:
-                raise UnsupportedCommand("ControlOverride requires active MANUAL_AXIS direct-control session")
+            if self.direct_control_mode != DIRECT_CONTROL_MANUAL:
+                raise UnsupportedCommand("ControlOverride requires active MANUAL_AXIS direct-control process")
             with self.control_override_lock:
                 self.control_override = model
                 self.control_override_updated_at = time.monotonic()
@@ -271,45 +376,18 @@ class MavsdkInterface(PluginBase):
     async def _handle_command(self, request: Dict[str, Any]) -> None:
         request_id, command = decode_occid_command(request)
         try:
-            if isinstance(command, occid.ArmCommand):
-                await self.drone.action.arm()
-            elif isinstance(command, occid.DisarmCommand):
-                await self.drone.action.disarm()
-            elif isinstance(command, occid.TakeoffCommand):
-                await self.drone.action.takeoff()
-            elif isinstance(command, occid.LandCommand):
-                await self.drone.action.land()
-            elif isinstance(command, occid.ReturnToLaunchCommand):
-                await self.drone.action.return_to_launch()
-            elif isinstance(command, occid.SetTakeoffAltitudeCommand):
-                await self.drone.action.set_takeoff_altitude(float(command.relative_altitude_m))
-            elif isinstance(command, occid.GoToCommand):
-                fields = goto_command_to_fields(
-                    command,
-                    current_absolute_altitude_m=self.last_abs_alt_m,
-                    current_relative_altitude_m=self.last_rel_alt_m,
-                    current_yaw_rad=(
-                        None
-                        if self.last_attitude is None
-                        else float(self.last_attitude.yaw_rad)
-                    ),
+            if isinstance(command, occid.StateChangeCommand):
+                await self._handle_state_change(command)
+            elif isinstance(command, occid.ProcessControlCommand):
+                await self._handle_process_control(command)
+            elif isinstance(command, occid.ConfigurationCommand):
+                await self._handle_configuration(command)
+            elif isinstance(command, occid.MotionCommand):
+                await self._handle_motion(command)
+            elif isinstance(command, (occid.ResourceCommand, occid.ExecutionCommand)):
+                raise UnsupportedCommand(
+                    f"MAVSDK adapter has no mapping for {type(command).__name__} operation={command.operation.name}"
                 )
-                await self.drone.action.goto_location(
-                    fields.latitude_deg,
-                    fields.longitude_deg,
-                    fields.absolute_altitude_m,
-                    fields.yaw_deg,
-                )
-            elif isinstance(command, occid.SetModeCommand):
-                await self._handle_set_mode(command)
-            elif isinstance(command, occid.SetWaypointCommand):
-                raise UnsupportedCommand("MAVSDK adapter waypoint write is not implemented")
-            elif isinstance(command, occid.SelectMissionCommand):
-                raise UnsupportedCommand("MAVSDK adapter onboard mission selection is not implemented")
-            elif isinstance(command, occid.BeginDirectControlCommand):
-                await self._begin_direct_control(command)
-            elif isinstance(command, occid.EndDirectControlCommand):
-                await self._end_direct_control()
             else:
                 raise UnsupportedCommand(f"unsupported OCCID UAV command {type(command).__name__}")
             self._respond(request_id, command, True)

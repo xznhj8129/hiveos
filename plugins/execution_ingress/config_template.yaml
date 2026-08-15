@@ -12,7 +12,6 @@ cfg:
   takeoff_altitude_m: 10.0
   takeoff_altitude_ok_fraction: 0.8
   post_takeoff_wait_s: 1.0
-  report_cache_size: 128
   occid_in_topic: OCCID/IN
   occid_out_topic: OCCID/OUT
   executor_id:

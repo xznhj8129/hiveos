@@ -22,6 +22,7 @@ class FakeBus:
 class FakeRuntime:
     def __init__(self) -> None:
         self.bus = FakeBus()
+        self.bus_config = {"topic_prefix": "mpfc/uav1"}
         self.state = {}
         self.wait_calls: list[tuple[str, float]] = []
 
@@ -39,19 +40,31 @@ class UavClientRoutingTests(unittest.TestCase):
             response_timeout_s=10.0,
         )
 
-    def test_convenience_command_dispatches_without_waiting(self) -> None:
+    def test_convenience_arm_maps_to_state_change_without_waiting(self) -> None:
         request_id = self.uav.arm()
         self.assertEqual(request_id, "req-1")
         self.assertEqual(self.runtime.wait_calls, [])
         topic, envelope = self.runtime.bus.published[-1]
         self.assertEqual(topic, "uav_controller/UAV/REQUEST")
+        command = envelope["data"]["command"]
         self.assertEqual(envelope["data"]["request_id"], "req-1")
-        self.assertEqual(envelope["data"]["command"]["_occid_model"], "ArmCommand")
+        self.assertEqual(command["_occid_model"], "StateChangeCommand")
+        self.assertEqual(command["operation"], "SET")
+        self.assertEqual(command["property_name"], "armed")
+        self.assertTrue(command["value"]["bool"])
+        self.assertEqual(command["target_ref"]["value"], "uav1")
 
     def test_execute_waits_only_when_explicitly_requested(self) -> None:
-        response = self.uav.execute(occid.ArmCommand(), timeout_s=3.0)
+        response = self.uav.execute(self.uav.arm_command(), timeout_s=3.0)
         self.assertTrue(response["ok"])
         self.assertEqual(self.runtime.wait_calls, [("req-1", 3.0)])
+
+    def test_go_to_maps_to_motion_command(self) -> None:
+        self.uav.go_to(45.0, -73.0, 20.0)
+        command = self.runtime.bus.published[-1][1]["data"]["command"]
+        self.assertEqual(command["_occid_model"], "MotionCommand")
+        self.assertEqual(command["operation"], "MOVE_TO")
+        self.assertEqual(command["destination"]["alt"], 20.0)
 
     def test_high_rate_attitude_uses_input_path_without_request_id(self) -> None:
         self.uav.set_attitude(0.1, -0.2, 0.3, 0.4)
@@ -62,17 +75,33 @@ class UavClientRoutingTests(unittest.TestCase):
         self.assertEqual(self.runtime.wait_calls, [])
 
     def test_generic_command_is_not_accepted_by_uav_service(self) -> None:
+        command = occid.Command(target_ref=self.uav.target_ref, constraints=[])
         with self.assertRaises(TypeError):
-            self.uav.send(occid.Command())
+            self.uav.send(command)
 
-    def test_direct_control_lifecycle_is_acknowledged_control_plane(self) -> None:
-        begin = self.uav.begin_direct_control(occid.DirectControlMode.ATTITUDE_THRUST)
+    def test_wrong_target_is_rejected(self) -> None:
+        command = occid.StateChangeCommand(
+            target_ref=occid.StringID(id_type=occid.IdentifierType.DB_ID, value="other"),
+            constraints=[],
+            operation=occid.StateChangeOperation.SET,
+            property_name="armed",
+            value=occid.MetadataValue(bool=True),
+        )
+        with self.assertRaisesRegex(ValueError, "target_ref"):
+            self.uav.send(command)
+
+    def test_direct_control_lifecycle_uses_process_control(self) -> None:
+        begin = self.uav.begin_direct_control("ATTITUDE_THRUST")
         end = self.uav.end_direct_control()
         self.assertTrue(begin["ok"])
         self.assertTrue(end["ok"])
         self.assertEqual(self.runtime.wait_calls, [("req-1", 10.0), ("req-2", 10.0)])
-        models = [item[1]["data"]["command"]["_occid_model"] for item in self.runtime.bus.published]
-        self.assertEqual(models, ["BeginDirectControlCommand", "EndDirectControlCommand"])
+        commands = [item[1]["data"]["command"] for item in self.runtime.bus.published]
+        self.assertEqual([command["_occid_model"] for command in commands], ["ProcessControlCommand", "ProcessControlCommand"])
+        self.assertEqual(commands[0]["operation"], "START")
+        self.assertEqual(commands[0]["process_name"], "direct_control.attitude_thrust")
+        self.assertEqual(commands[1]["operation"], "STOP")
+        self.assertEqual(commands[1]["process_name"], "direct_control")
 
 
 class RuntimeImportTests(unittest.TestCase):
