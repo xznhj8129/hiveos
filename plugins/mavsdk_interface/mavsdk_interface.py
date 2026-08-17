@@ -518,7 +518,10 @@ class MavsdkInterface(PluginBase):
             remaining = battery.remaining_percent
             remaining_pct = None if remaining is None else float(remaining) * 100.0
             state = occid.ElectricalResourceState(
-                source_id=f"battery:{int(battery.id)}",
+                source_id=occid.StringID(
+                    id_type=occid.IdentifierType.ASSET_ID,
+                    value=f"battery:{int(battery.id)}",
+                ),
                 voltage_v=None if battery.voltage_v is None else float(battery.voltage_v),
                 current_a=None if battery.current_battery_a is None else float(battery.current_battery_a),
                 consumed_ah=None if battery.capacity_consumed_ah is None else float(battery.capacity_consumed_ah),

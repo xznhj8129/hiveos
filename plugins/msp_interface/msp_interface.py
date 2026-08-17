@@ -493,7 +493,10 @@ class MspInterface(PluginBase):
         )
 
         power = occid.ElectricalResourceState(
-            source_id="battery:0",
+            source_id=occid.StringID(
+                id_type=occid.IdentifierType.ASSET_ID,
+                value="battery:0",
+            ),
             voltage_v=analog.get("vbat"),
             current_a=analog.get("amperage"),
             power_w=analog.get("powerDraw"),
