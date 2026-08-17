@@ -402,7 +402,6 @@ class MspInterface(PluginBase):
         global_ok = gps["fixType"] == InavEnums.gpsFixType_e.GPS_FIX_3D and gps["numSat"] >= int(self.home_min_satellites)
         active_modes = status["activeModes"]
         active_mode_names = [self._box_display_name(mode) for mode in active_modes]
-        active_mode_ids = [int(mode.value) for mode in active_modes]
         override_active = boxes.BoxEnum.BOXMSPRCOVERRIDE in active_modes
         failsafe = boxes.BoxEnum.BOXFAILSAFE in active_modes
 
@@ -431,10 +430,6 @@ class MspInterface(PluginBase):
             override_active=override_active,
             failsafe=failsafe,
             standard_mode=standard_mode_from_native_names(active_mode_names),
-            native_mode_name=active_mode_names[0] if active_mode_names else None,
-            native_active_mode_codes=active_mode_ids,
-            native_active_mode_names=active_mode_names,
-            native_nav_state_code=None if nav_status.get("navState") is None else int(nav_status["navState"]),
             navigation_validity=nav_validity,
             readiness=readiness,
             runtime_load=runtime_load,
@@ -460,15 +455,6 @@ class MspInterface(PluginBase):
                 hdop=None if gps_statistics.get("hdop") is None else float(gps_statistics["hdop"]),
             ),
             navigation_validity=nav_validity,
-        )
-        gnss = gnss.model_copy(
-            update={
-                "eph": gps_statistics.get("eph"),
-                "epv": gps_statistics.get("epv"),
-                "last_message_dt": gps_statistics.get("lastMessageDt"),
-                "errors": gps_statistics.get("errors"),
-                "timeouts": gps_statistics.get("timeouts"),
-            }
         )
         self.latest_location = location
         self._publish_model(LOCATION, location)
@@ -507,6 +493,7 @@ class MspInterface(PluginBase):
         )
 
         power = occid.ElectricalResourceState(
+            source_id="battery:0",
             voltage_v=analog.get("vbat"),
             current_a=analog.get("amperage"),
             power_w=analog.get("powerDraw"),
@@ -514,7 +501,6 @@ class MspInterface(PluginBase):
             consumed_mwh=analog.get("mWhDrawn"),
             remaining_pct=analog.get("percentageRemaining"),
             remaining_capacity=analog.get("remainingCapacity"),
-            rssi=analog.get("rssi"),
         )
         self._publish_model(POWER, power)
 
