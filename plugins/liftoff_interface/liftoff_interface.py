@@ -87,9 +87,6 @@ class LiftoffInterface(PluginBase):
             occid.FlightControlState(
                 in_air=bool(in_air),
                 standard_mode=occid.StandardFlightMode.NON_STANDARD,
-                native_mode_name="LIFTOFF_SIM",
-                native_active_mode_codes=[],
-                native_active_mode_names=["LIFTOFF_SIM"],
                 navigation_validity=nav,
                 readiness=readiness,
             ),
@@ -160,7 +157,7 @@ class LiftoffInterface(PluginBase):
                         body_frame=occid.BodyReferenceFrame.FRD,
                         altitude=occid.AltitudeState(
                             relative_m=altitude_up_m,
-                            datum=occid.AltitudeDatum.RELATIVE,
+                            relative_datum=occid.AltitudeDatum.RELATIVE,
                         ),
                     ),
                 )

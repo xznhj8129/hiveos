@@ -350,7 +350,7 @@ class AtakInterface(PluginBase):
             subject_id=self._subject_id(uid),
             timestamp=timestamp,
             position=location,
-            links={},
+            link_states={},
         )
 
     def _handle_inbound(self, payload: bytes, source: tuple[str, int]) -> None:
