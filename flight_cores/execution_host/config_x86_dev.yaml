@@ -1,8 +1,7 @@
 # Fast native x86 development runtime for the Block 1 execution path.
 # The QEMU user network exposes the host to the guest at 10.0.2.2.
 # sigmac3 forwards host UDP 14540 to this guest for PX4 SIH and host UDP
-# 15555 to guest UDP 5555 for control-side HiveLink delivery. The MPFC-only
-# acceptance harness uses its own return node/port so it can coexist with Sigma.
+# 15555 to guest UDP 5555 for control-side HiveLink delivery.
 my_name: uav1
 runtime_mode: resident
 
@@ -53,10 +52,6 @@ plugins:
           ip:
           - 10.0.2.2
           - 5555
-        accept:
-          ip:
-          - 10.0.2.2
-          - 15556
 
 - plugin: execution_ingress
   cfg:

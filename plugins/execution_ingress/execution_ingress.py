@@ -336,7 +336,7 @@ class ExecutionIngress(PluginBase):
             subject_id=self.asset_id,
             timestamp=time.time(),
             position=location,
-            links={},
+            link_states={},
         )
 
     def _publish_status(
