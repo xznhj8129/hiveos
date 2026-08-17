@@ -111,8 +111,6 @@ class MavsdkInterface(PluginBase):
         self.nav_validity = occid.NavigationValidity()
         self.readiness = occid.NavReadinessState(mode_problems=[], health_problems=[])
         self.flight_control = occid.FlightControlState(
-            native_active_mode_codes=[],
-            native_active_mode_names=[],
             navigation_validity=self.nav_validity,
             readiness=self.readiness,
         )
@@ -487,7 +485,6 @@ class MavsdkInterface(PluginBase):
             self.gnss_state = self.gnss_state.model_copy(
                 update={
                     "fix_type": gnss_fix_type_from_native_value(int(native_fix)),
-                    "fix_code": int(native_fix),
                     "satellites_used": int(gps_info.num_satellites),
                 }
             )
@@ -521,7 +518,7 @@ class MavsdkInterface(PluginBase):
             remaining = battery.remaining_percent
             remaining_pct = None if remaining is None else float(remaining) * 100.0
             state = occid.ElectricalResourceState(
-                battery_id=int(battery.id),
+                source_id=f"battery:{int(battery.id)}",
                 voltage_v=None if battery.voltage_v is None else float(battery.voltage_v),
                 current_a=None if battery.current_battery_a is None else float(battery.current_battery_a),
                 consumed_ah=None if battery.capacity_consumed_ah is None else float(battery.capacity_consumed_ah),
@@ -538,8 +535,6 @@ class MavsdkInterface(PluginBase):
             self.readiness = self.readiness.model_copy(update={"mode_name": mode_name})
             self._publish_flight_control(
                 standard_mode=standard_mode_from_native_name(mode_name),
-                native_mode_name=mode_name,
-                native_active_mode_names=[mode_name],
                 readiness=self.readiness,
             )
             if self.stop_event.is_set():
