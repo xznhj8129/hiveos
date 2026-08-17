@@ -9,48 +9,11 @@ binary transports that actually need a compact wire representation.
 from __future__ import annotations
 
 import base64
-import importlib
-import os
-import sys
 from enum import Enum, IntEnum as StdIntEnum
-from pathlib import Path
 from typing import Any
 
+import occid
 
-def _is_occid_sdk(module: Any) -> bool:
-    return hasattr(module, "OCCIDModel") and hasattr(module, "OCCID_MODEL_BY_ID")
-
-
-def _load_occid():
-    candidates: list[Path] = []
-    configured = os.environ.get("OCCID_PATH")
-    if configured:
-        candidates.append(Path(configured).expanduser())
-    candidates.append(Path(__file__).resolve().parents[2] / "occid")
-
-    for path in candidates:
-        if not path.exists():
-            continue
-        path_text = str(path.resolve())
-        if path_text not in sys.path:
-            sys.path.insert(0, path_text)
-
-    try:
-        candidate = importlib.import_module("occid")
-    except ImportError as exc:
-        searched = ", ".join(str(path) for path in candidates)
-        raise RuntimeError(
-            "OCCID Python SDK not found. Set OCCID_PATH to the OCCID repository root "
-            f"or place it beside MPFC. searched={searched}"
-        ) from exc
-    if not _is_occid_sdk(candidate):
-        raise RuntimeError(
-            f"imported module 'occid' is not the OCCID SDK module={getattr(candidate, '__file__', None)}"
-        )
-    return candidate
-
-
-occid = _load_occid()
 
 OCCID_MODEL_KEY = "_occid_model"
 OCCID_MODEL_ID_KEY = "_occid_model_id"
