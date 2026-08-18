@@ -29,23 +29,23 @@ def record(value: str) -> object:
 
 
 def build_bundle() -> tuple[object, object, object, object, object]:
-    location = occid.MissionPoi(
-        uid=sid("location.target"),
+    location = occid.Mark(
+        record=record("location"),
+        location_id=sid("location.target"),
         name="Target",
-        pos=occid.GlobalPosition(
-            lat=45.5017,
-            lon=-73.5673,
+        position=occid.GlobalPosition(
+            lat=36.530440,
+            lon=-83.216383,
             alt=20.0,
             alt_frame=occid.AltitudeDatum.RELATIVE,
         ),
-        origin="test",
     )
     task = occid.TaskManeuver(
         record=record("task"),
         task_id=sid("task.move"),
         instruction="Move to the designated target point and hold there.",
         target_refs=[],
-        location_refs=[location.uid],
+        location_refs=[location.location_id],
         objective_id=None,
         constraints=[],
         intent=occid.ManeuverIntent.MOVE,
@@ -115,9 +115,9 @@ class ExecutionIngressTests(unittest.TestCase):
             ("control", "location", "DB_ID:location.target"): location,
         }
         destination = ingress._resolve_move_destination("control", task)
-        self.assertEqual(destination, location.pos)
-        self.assertEqual(_location_identity(location), location.uid)
-        self.assertEqual(_location_position(location), location.pos)
+        self.assertEqual(destination, location.position)
+        self.assertEqual(_location_identity(location), location.location_id)
+        self.assertEqual(_location_position(location), location.position)
 
     def test_move_task_rejects_unresolved_location(self) -> None:
         _, task, _, _, _ = build_bundle()
@@ -161,8 +161,8 @@ class ExecutionIngressTests(unittest.TestCase):
         location, _, _, _, _ = build_bundle()
         observed = occid.LocationState(
             position=occid.GlobalPosition(
-                lat=location.pos.lat,
-                lon=location.pos.lon,
+                lat=location.position.lat,
+                lon=location.position.lon,
                 alt=500.0,
                 alt_frame=occid.AltitudeDatum.SEA_LEVEL,
             ),
@@ -173,7 +173,7 @@ class ExecutionIngressTests(unittest.TestCase):
                 relative_datum=occid.AltitudeDatum.RELATIVE,
             ),
         )
-        horizontal_m, altitude_error_m = _arrival_metrics(observed, location.pos)
+        horizontal_m, altitude_error_m = _arrival_metrics(observed, location.position)
         self.assertAlmostEqual(horizontal_m, 0.0, places=5)
         self.assertAlmostEqual(altitude_error_m, 0.5, places=5)
 
