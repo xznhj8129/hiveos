@@ -20,7 +20,9 @@ secrets/
 private/
 config/local*
 config/real*
+deploy/rpi/image.conf
 deploy/rpi/.build/
+deploy/rpi/.build-compose/
 deploy/rpi/.cache/
 deploy/rpi/.vm/
 deploy/rpi/dist/

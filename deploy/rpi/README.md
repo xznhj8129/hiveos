@@ -5,14 +5,28 @@ Zero 2 W class target. The same raw image can also be booted under QEMU for ARM
 qualification; normal MPFC development uses the x86 KVM runtime managed by
 Sigmac3.
 
-The image contains MPFC, installed OCCID and HiveLink packages, a Python runtime,
-loopback-only Mosquitto, SSH, and the MPFC systemd runtime. It is independent of
-Sigma.
+The core image contains MPFC, installed OCCID and HiveLink packages, a Python
+runtime, loopback-only Mosquitto, SSH, and the MPFC systemd runtime. Optional
+physical-node capabilities are composed into that core image only when selected.
+The appliance is independent of Sigma.
 
 ## Build model
 
-The appliance build is layered so normal development does not repeatedly run
-package installation under ARM emulation.
+```text
+build-image
+    |
+    +--> build-image-core
+    |      pinned Raspberry Pi OS
+    |      MPFC + OCCID + HiveLink + MAVSDK + Mosquitto
+    |
+    +--> selected deploy/rpi/components/*
+    |
+    +--> provisioning directory -> /home/mpfc/keys
+    |
+    +--> final image + manifest
+```
+
+`build-image-core` retains the existing cached system/Python build:
 
 1. A pinned Raspberry Pi OS Lite ARM64 image is expanded and provisioned with
    the small system/runtime package set. This prepared OS layer is cached by the
@@ -28,24 +42,152 @@ package installation under ARM emulation.
    copied into the appliance and no runtime path override is used.
 5. MPFC application source, service files, identity, password, network settings,
    and runtime configuration are host-side overlays onto the prepared image.
-6. QEMU system emulation is optional ARM runtime qualification, not routine
-   Python dependency installation or normal development.
+
+`build-image` then applies only enabled component installers and provisioning.
+Component definitions are build inputs and are removed from `/opt/mpfc` before
+emitting the image, so an unselected component contributes no package, source,
+driver, service, or dependency to the appliance.
 
 `MPFC_BUILD_CACHE` may point at a persistent cache outside the source checkout.
-Sigmac3 defaults this to `~/.cache/sigmac3/mpfc`, so deleting/recloning the MPFC
-deployment root does not gratuitously repeat unchanged dependency work.
+Sigmac3 defaults this to `~/.cache/sigmac3/mpfc`.
 
-## Configuration
+## Image configuration
 
-Standalone defaults live in:
+The authoritative non-interactive interface is an INI file:
 
-```text
-deploy/rpi/defaults.env
+```ini
+[image]
+hostname=mpfc
+target=pi-zero-2w
+
+[components]
+wfb-ng=yes
+
+[wfb-ng]
+driver=rtl8812eu
+wifi_channel=161
+wifi_region=CA
+
+[provisioning]
+directory=/path/to/provisioning
 ```
 
-They define node identity, control/guest addresses, network prefix, HiveLink
-port, bridge/tap names, physical/VM MAVLink connections, and the appliance
-password.
+See `image.conf.example`.
+
+Build it directly:
+
+```bash
+sudo ./deploy/rpi/build-image --config ./deploy/rpi/image.conf
+```
+
+If `deploy/rpi/image.conf` exists, `build-image` uses it automatically. The file
+is ignored by Git so local deployment choices do not become repository state.
+
+### Terminal configurator
+
+`configure` is only a small writer for the same INI contract. It contains no
+image-build implementation:
+
+```bash
+./deploy/rpi/configure
+```
+
+It writes `deploy/rpi/image.conf`, asks whether WFB-NG is wanted, asks for the
+WFB radio driver and basic radio settings when selected, and can invoke
+`build-image` after writing the file.
+
+New optional capabilities belong under:
+
+```text
+deploy/rpi/components/<component>/install-rootfs
+```
+
+and are enabled through `[components]`. An enabled component without an
+installer is a hard error; there are no placeholder profiles or silent fallbacks.
+
+## WFB-NG component
+
+WFB-NG is the first optional image component. It follows the upstream WFB-NG
+Setup HOWTO rather than treating a WFB image as the base operating system.
+
+Supported driver choices:
+
+```text
+rtl8812au
+rtl8812eu
+```
+
+The component:
+
+- installs WFB-NG into the existing MPFC Raspberry Pi OS appliance;
+- installs matching Raspberry Pi `linux-image-rpi-v8` and
+  `linux-headers-rpi-v8` packages before building the patched driver;
+- builds the selected patched Realtek driver through DKMS for the target Pi v8
+  kernel, explicitly rather than using the build host's `uname`;
+- writes `/etc/wifibroadcast.cfg` from the selected channel/region;
+- enables `wifibroadcast@drone.service`;
+- keeps WFB-NG away from the FC serial device: MPFC remains the owner of the
+  physical MAVLink endpoint. WFB's drone MAVLink profile listens on local UDP
+  `127.0.0.1:14550` for an explicit bridge/router if one is later desired;
+- listens for drone video input on UDP `0.0.0.0:5602`;
+- uses upstream NIC autodetection rather than baking a developer-specific
+  `wlanX` name into the image.
+
+The component pins its WFB package/driver inputs in its installer and records the
+actual WFB version, driver, driver revision, target kernel, channel, and region in
+the final image manifest.
+
+WFB-NG expects the drone key at `/etc/drone.key`. The appliance keeps the
+canonical provisioning boundary at `/home/mpfc/keys`, so the component installs:
+
+```text
+/etc/drone.key -> /home/mpfc/keys/drone.key
+```
+
+A WFB-enabled image may be built without provisioning, but the WFB service is
+not operational until a matching `drone.key` is present.
+
+## Provisioning
+
+Deployment-specific keys, certificates, identities, and small configuration
+files are supplied as ordinary data:
+
+```bash
+sudo ./deploy/rpi/build-image \
+  --config ./deploy/rpi/image.conf \
+  --provision /path/to/provisioning
+```
+
+`--provision` overrides `[provisioning] directory=...` from the INI file.
+The directory is copied verbatim as data to:
+
+```text
+/home/mpfc/keys/
+```
+
+with deliberately simple permissions:
+
+```text
+/home/mpfc/keys      mpfc:mpfc 0700
+regular files        mpfc:mpfc 0600
+subdirectories       mpfc:mpfc 0700
+```
+
+The builder never executes provisioning content. Components adapt upstream paths
+back to `/home/mpfc/keys`; deployment material does not create another discovery
+mechanism.
+
+`provisioning.example/` documents a non-secret example structure. Keep real
+provisioning outside Git.
+
+The image manifest records only relative provisioned filenames and a deterministic
+hash of the provisioning tree. It never copies secret contents into the manifest.
+
+## Core runtime configuration
+
+Standalone core defaults live in `deploy/rpi/defaults.env`. They define node
+identity, control/guest addresses, network prefix, HiveLink port, bridge/tap
+names, physical/VM MAVLink connections, and the appliance password.
 
 Default login:
 
@@ -68,10 +210,6 @@ OCCID and HiveLink are ordinary installed packages in `/opt/mpfc/.venv`. There
 is no `OCCID_PATH`, `HIVELINK_PATH`, source `.pth`, `/opt/occid`, or
 `/opt/hivelink` runtime import mechanism.
 
-The image is provisioned before first boot. Raspberry Pi OS `userconfig.service`
-and the unused `systemd-networkd-wait-online.service` are masked in the prepared
-system layer.
-
 ## Host prerequisites
 
 On Debian, Ubuntu, or Mint:
@@ -86,15 +224,21 @@ sudo apt install -y \
   iproute2 openssh-client sshpass iputils-ping
 ```
 
-The first prepared-system cache miss uses `qemu-aarch64-static` only for the
-small target OS provisioning step. ARM `pip` is not used.
+The first prepared-system cache miss and optional component installation use
+`qemu-aarch64-static`. ARM pip is not used for the core MPFC Python layer.
 
 ## Build the image
 
-Keep MPFC, OCCID, and HiveLink as sibling checkouts, then run:
+Keep MPFC, OCCID, and HiveLink as sibling checkouts, then run either:
 
 ```bash
 sudo ./deploy/rpi/build-image
+```
+
+or:
+
+```bash
+sudo ./deploy/rpi/build-image --config my-drone.conf
 ```
 
 The OCCID/HiveLink checkout paths are build inputs only. `--occid-path` and
@@ -111,13 +255,9 @@ mpfc-rpi-zero2w.img.kernel8.img
 mpfc-rpi-zero2w.img.raspi3ap.dtb
 ```
 
-The manifest records the base image, prepared-system cache key, Python-layer
-cache key, target Python version, source revisions, node/network settings,
-MAVLink defaults, and password-auth login mode.
-
-A source-only MPFC rebuild reuses the prepared system/Python layers when their
-inputs have not changed. OCCID or HiveLink changes are installed through normal
-Python packaging during the image build.
+The final manifest records the core base/cache/Python/source information plus
+image target/hostname, component selection and component-owned version data,
+and provisioning filename/hash evidence.
 
 ## Physical Pi
 
@@ -176,21 +316,13 @@ Useful commands:
 ./deploy/rpi/pi-vm stop
 ```
 
-`ssh`, `logs`, and `deploy` use `MPFC_PI_PASSWORD` through `sshpass`; they do not
-read personal SSH keys.
-
-`deploy` is only for MPFC application-source iteration. It rsyncs `/opt/mpfc`,
-checks the installed OCCID contract, and restarts MPFC. OCCID, HiveLink, or other
+`deploy` is only for MPFC application-source iteration. OCCID, HiveLink, or other
 Python dependency changes require an image rebuild so the installed environment
 remains authoritative.
 
-## PX4 testing
-
-PX4 SITL is a test peer for MPFC/MAVSDK and is not installed in the appliance.
-A development manager may launch PX4 on the control host while QEMU boots and
-then validate MPFC against the ready peer.
-
 ## Guest services
+
+Core image:
 
 ```text
 ssh.service
@@ -199,13 +331,18 @@ mpfc-runtime-config.service
 mpfc.service
 ```
 
-Mosquitto listens only on loopback and remains private MPFC node-local IPC.
+WFB-NG image additionally enables:
+
+```text
+wifibroadcast@drone.service
+```
 
 Useful diagnostics:
 
 ```bash
 journalctl -fu mpfc.service
 mosquitto_sub -h 127.0.0.1 -p 1883 -v -t 'mpfc/#'
+journalctl -fu wifibroadcast@drone.service
 ```
 
 ## Validation boundary
@@ -213,4 +350,6 @@ mosquitto_sub -h 127.0.0.1 -p 1883 -v -t 'mpfc/#'
 The VM validates the ARM64 userspace, cross-staged Python/MAVSDK runtime,
 systemd services, private local IPC, installed OCCID/HiveLink packages,
 independent IP networking, and PX4 interaction. It does not validate physical
-Zero 2 W GPIO, RF, electrical behavior, or serial timing.
+Zero 2 W GPIO, RF, electrical behavior, USB WiFi injection, driver RF behavior,
+or serial timing. WFB-NG radio acceptance therefore requires the physical Pi and
+selected radio hardware.
