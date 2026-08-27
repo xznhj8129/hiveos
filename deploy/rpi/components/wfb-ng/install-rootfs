@@ -3,8 +3,9 @@ set -Eeuo pipefail
 
 : "${MPFC_IMAGE_CONFIG:?MPFC_IMAGE_CONFIG is required}"
 
-WFB_APT_VERSION=26.8.20.71978
 WFB_APT_CHANNEL=master
+WFB_SOURCE_REPO=https://github.com/svpcom/wfb-ng.git
+WFB_SOURCE_COMMIT=3504a3870189fdc4bb1f7e2a2f141a740973a185
 RTL8812AU_REPO=https://github.com/svpcom/rtl8812au.git
 RTL8812AU_COMMIT=6e75916416de1dce5ecd37f824896bebf96aaf8f
 RTL8812EU_REPO=https://github.com/svpcom/rtl8812eu.git
@@ -48,8 +49,31 @@ apt-get install -y --no-install-recommends \
 curl -fsSL https://apt.wfb-ng.org/public.asc | gpg --dearmor --yes -o /usr/share/keyrings/wfb-ng.gpg
 printf 'deb [signed-by=/usr/share/keyrings/wfb-ng.gpg] https://apt.wfb-ng.org/ %s %s\n' \
     "$(lsb_release -cs)" "${WFB_APT_CHANNEL}" > /etc/apt/sources.list.d/wfb-ng.list
-apt-get update
-apt-get install -y --no-install-recommends "wfb-ng=${WFB_APT_VERSION}"
+if ! apt-get update; then
+    echo "WFB-NG apt repository update failed; falling back to source build" >&2
+    rm -f /etc/apt/sources.list.d/wfb-ng.list /usr/share/keyrings/wfb-ng.gpg
+    apt-get update
+fi
+
+WFB_INSTALL_SOURCE="apt.wfb-ng.org/${WFB_APT_CHANNEL}"
+if ! apt-get install -y --no-install-recommends wfb-ng; then
+    echo "WFB-NG apt package unavailable; falling back to pinned source build" >&2
+    apt-get install -y --no-install-recommends \
+        python3-all python3-all-dev python3-venv libpcap-dev libsodium-dev libevent-dev \
+        python3-pip python3-pyroute2 python3-msgpack python3-twisted python3-serial \
+        python3-jinja2 debhelper dh-python fakeroot libgstrtspserver-1.0-dev \
+        libcatch2-dev
+
+    rm -rf /tmp/wfb-ng-source
+    GIT_TERMINAL_PROMPT=0 git clone --quiet "${WFB_SOURCE_REPO}" /tmp/wfb-ng-source
+    git -C /tmp/wfb-ng-source checkout --quiet "${WFB_SOURCE_COMMIT}"
+    (
+        cd /tmp/wfb-ng-source
+        make deb
+    )
+    apt-get install -y --no-install-recommends /tmp/wfb-ng-source/deb_dist/*.deb
+    WFB_INSTALL_SOURCE="github.com/svpcom/wfb-ng@${WFB_SOURCE_COMMIT}"
+fi
 
 case "${DRIVER}" in
     rtl8812au)
@@ -114,7 +138,7 @@ install -d -m 0755 /etc/mpfc/components
 WFB_VERSION=$(dpkg-query -W -f='${Version}' wfb-ng 2>/dev/null || printf unknown)
 cat > /etc/mpfc/components/wfb-ng.manifest <<EOF_MANIFEST
 wfb_ng_version=${WFB_VERSION}
-wfb_ng_source=apt.wfb-ng.org/${WFB_APT_CHANNEL}
+wfb_ng_source=${WFB_INSTALL_SOURCE}
 wfb_driver=${DRIVER}
 wfb_driver_revision=${DRIVER_COMMIT}
 wfb_kernel=${KERNEL_VERSION}
@@ -122,7 +146,7 @@ wfb_wifi_channel=${WIFI_CHANNEL}
 wfb_wifi_region=${WIFI_REGION}
 EOF_MANIFEST
 
-rm -rf /tmp/wfb-driver
+rm -rf /tmp/wfb-driver /tmp/wfb-ng-source
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 rm -f /usr/sbin/policy-rc.d
