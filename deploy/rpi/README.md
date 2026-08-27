@@ -1,10 +1,13 @@
 # MPFC Raspberry Pi appliance
 
 This directory builds the MPFC companion-computer appliance for a Raspberry Pi
-Zero 2 W class target and boots the same raw image under QEMU for development.
+Zero 2 W class target. The same raw image can also be booted under QEMU for ARM
+qualification; normal MPFC development uses the x86 KVM runtime managed by
+Sigmac3.
 
-The image contains MPFC, OCCID, HiveLink, a Python runtime, loopback-only
-Mosquitto, SSH, and the MPFC systemd runtime. It is independent of Sigma.
+The image contains MPFC, installed OCCID and HiveLink packages, a Python runtime,
+loopback-only Mosquitto, SSH, and the MPFC systemd runtime. It is independent of
+Sigma.
 
 ## Build model
 
@@ -20,10 +23,13 @@ package installation under ARM emulation.
    resolved requirements inputs.
 3. `crcmod` is supplied by the Debian ARM64 `python3-crcmod` package because it
    contains a target-native extension.
-4. MPFC, OCCID, HiveLink, service files, identity, password, network settings,
+4. OCCID and HiveLink are installed into the target virtualenv as normal Python
+   packages from the selected source checkouts. Their source trees are not
+   copied into the appliance and no runtime path override is used.
+5. MPFC application source, service files, identity, password, network settings,
    and runtime configuration are host-side overlays onto the prepared image.
-5. QEMU system emulation is used for runtime acceptance, not routine Python
-   dependency installation.
+6. QEMU system emulation is optional ARM runtime qualification, not routine
+   Python dependency installation or normal development.
 
 `MPFC_BUILD_CACHE` may point at a persistent cache outside the source checkout.
 Sigmac3 defaults this to `~/.cache/sigmac3/mpfc`, so deleting/recloning the MPFC
@@ -58,6 +64,10 @@ At runtime:
 - QEMU supplies VM-only settings on the removable `MPFC_CONFIG` disk;
 - `run-mpfc` renders `/run/mpfc/config.yaml` immediately before MPFC starts.
 
+OCCID and HiveLink are ordinary installed packages in `/opt/mpfc/.venv`. There
+is no `OCCID_PATH`, `HIVELINK_PATH`, source `.pth`, `/opt/occid`, or
+`/opt/hivelink` runtime import mechanism.
+
 The image is provisioned before first boot. Raspberry Pi OS `userconfig.service`
 and the unused `systemd-networkd-wait-online.service` are masked in the prepared
 system layer.
@@ -87,6 +97,10 @@ Keep MPFC, OCCID, and HiveLink as sibling checkouts, then run:
 sudo ./deploy/rpi/build-image
 ```
 
+The OCCID/HiveLink checkout paths are build inputs only. `--occid-path` and
+`--hivelink-path` may select other checkouts without creating runtime path
+coupling in the resulting image.
+
 Outputs under `deploy/rpi/dist/`:
 
 ```text
@@ -101,8 +115,9 @@ The manifest records the base image, prepared-system cache key, Python-layer
 cache key, target Python version, source revisions, node/network settings,
 MAVLink defaults, and password-auth login mode.
 
-A source-only rebuild reuses the prepared system/Python layers when their inputs
-have not changed.
+A source-only MPFC rebuild reuses the prepared system/Python layers when their
+inputs have not changed. OCCID or HiveLink changes are installed through normal
+Python packaging during the image build.
 
 ## Physical Pi
 
@@ -164,9 +179,10 @@ Useful commands:
 `ssh`, `logs`, and `deploy` use `MPFC_PI_PASSWORD` through `sshpass`; they do not
 read personal SSH keys.
 
-`deploy` is for source-only iteration. It rsyncs MPFC/OCCID/HiveLink and restarts
-MPFC without running target pip. If dependency inputs change, rebuild the image
-so the corresponding cached dependency layer is regenerated.
+`deploy` is only for MPFC application-source iteration. It rsyncs `/opt/mpfc`,
+checks the installed OCCID contract, and restarts MPFC. OCCID, HiveLink, or other
+Python dependency changes require an image rebuild so the installed environment
+remains authoritative.
 
 ## PX4 testing
 
@@ -195,6 +211,6 @@ mosquitto_sub -h 127.0.0.1 -p 1883 -v -t 'mpfc/#'
 ## Validation boundary
 
 The VM validates the ARM64 userspace, cross-staged Python/MAVSDK runtime,
-systemd services, private local IPC, OCCID, HiveLink, independent IP networking,
-and PX4 interaction. It does not validate physical Zero 2 W GPIO, RF,
-electrical behavior, or serial timing.
+systemd services, private local IPC, installed OCCID/HiveLink packages,
+independent IP networking, and PX4 interaction. It does not validate physical
+Zero 2 W GPIO, RF, electrical behavior, or serial timing.

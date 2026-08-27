@@ -28,7 +28,7 @@ Commands:
   console  Follow the background VM serial console
   ssh      SSH directly to ${GUEST_IP} as mpfc
   logs     Follow mpfc.service logs
-  deploy   Rsync source overlays into the guest and restart MPFC
+  deploy   Rsync MPFC application source into the guest and restart MPFC
 
 Options used by up/start:
   --image PATH         Appliance raw image, default ${DEFAULT_IMAGE}
@@ -299,12 +299,6 @@ case "${COMMAND}" in
         command -v rsync >/dev/null || { echo "missing rsync" >&2; exit 1; }
         require_sshpass
         REPO_ROOT=$(cd -- "${SCRIPT_DIR}/../.." && pwd)
-        OCCID_PATH=$(cd -- "${REPO_ROOT}/.." && pwd)/occid
-        HIVELINK_PATH=$(cd -- "${REPO_ROOT}/.." && pwd)/hivelink
-        [[ -d ${OCCID_PATH} && -d ${HIVELINK_PATH} ]] || {
-            echo "expected sibling occid and hivelink checkouts" >&2
-            exit 1
-        }
         RSYNC_SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PubkeyAuthentication=no -o PreferredAuthentications=password"
         common_excludes=(
             --exclude=.git
@@ -318,10 +312,7 @@ case "${COMMAND}" in
         )
         rsync -az --delete "${common_excludes[@]}" -e "${RSYNC_SSH}" \
             "${REPO_ROOT}/" "mpfc@${GUEST_IP}:/opt/mpfc/"
-        rsync -az --delete --exclude=.git --exclude='__pycache__' --exclude='*.pyc' -e "${RSYNC_SSH}" \
-            "${OCCID_PATH}/" "mpfc@${GUEST_IP}:/opt/occid/"
-        rsync -az --delete --exclude=.git --exclude='__pycache__' --exclude='*.pyc' -e "${RSYNC_SSH}" \
-            "${HIVELINK_PATH}/" "mpfc@${GUEST_IP}:/opt/hivelink/"
+        "${ssh_base[@]}" /opt/mpfc/.venv/bin/python -m occid.contract check /opt/mpfc
         "${ssh_base[@]}" sudo -n /usr/bin/systemctl restart mpfc.service
         ;;
     *)

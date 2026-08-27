@@ -21,7 +21,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
-ReadWritePaths=/run/mpfc /var/log/mpfc /opt/mpfc /opt/occid /opt/hivelink /home/mpfc
+ReadWritePaths=/run/mpfc /var/log/mpfc /opt/mpfc /home/mpfc
 
 [Install]
 WantedBy=multi-user.target

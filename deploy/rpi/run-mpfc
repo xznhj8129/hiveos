@@ -74,7 +74,6 @@ def main() -> None:
 
     env = os.environ.copy()
     env["MAIN_CONFIG"] = str(RUNTIME_CONFIG)
-    env.setdefault("OCCID_PATH", "/opt/occid")
     env.setdefault("PYTHONUNBUFFERED", "1")
     os.chdir("/opt/mpfc")
     os.execve("/opt/mpfc/.venv/bin/python", ["python", "/opt/mpfc/main.py"], env)

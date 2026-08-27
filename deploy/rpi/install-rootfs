@@ -32,7 +32,7 @@ printf 'mpfc:%s\n' "${MPFC_PI_PASSWORD}" | chpasswd
 usermod -a -G dialout,systemd-journal mpfc
 
 install -d -o mpfc -g mpfc -m 0755 /var/log/mpfc /run/mpfc
-install -d -m 0755 /opt/mpfc /opt/occid /opt/hivelink
+install -d -m 0755 /opt/mpfc
 
 # Create only the target interpreter environment here. Python application
 # dependencies are cross-resolved and staged by the x86 host builder later;

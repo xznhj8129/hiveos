@@ -36,9 +36,3 @@ python3 -m pip install \
     --no-compile \
     --upgrade \
     -r "${REQUIREMENTS}"
-
-# OCCID and HiveLink are shipped as source trees in the appliance rather than
-# as separately installed wheels. Register both paths in site-packages so the
-# venv behaves the same for direct smoke tests and for mpfc.service.
-printf '/opt/occid\n' > "${TARGET_DIR}/occid-source.pth"
-printf '/opt/hivelink\n' > "${TARGET_DIR}/hivelink-source.pth"
